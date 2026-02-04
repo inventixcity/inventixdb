@@ -1,0 +1,15 @@
+# Object files
+*.o
+
+# Executables (Windows)
+*.exe
+inventixdb
+inventix-server
+
+# Logs and Data
+*.log
+*.snap
+*.db
+
+# VS Code
+.vscode/
