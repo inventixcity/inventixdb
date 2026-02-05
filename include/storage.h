@@ -33,6 +33,18 @@ void kv_destroy(KVStore *store);
 void kv_snapshot(KVStore *store);
 void kv_recover(KVStore *store);
 
+// Indexing
+void kv_create_index(KVStore *store, const char *table, const char *col);
+int kv_has_index(KVStore *store, const char *table, const char *col);
+char* kv_search_index(KVStore *store, const char *table, const char *col, const char *val); // Returns PK
+// Internal helper to update index on insert (exposed for executor)
+void kv_update_indexes(KVStore *store, const char *table, const char *pk, const char *json_row);
+
+// For Range Queries
+typedef struct SkipNode SkipNode;
+typedef int (*IndexRangeCallback)(const char *pk, const char *val, void *ctx); // Ret 0 to stop
+void kv_scan_index_range(KVStore *store, const char *table, const char *col, const char *start_val, int inclusive, IndexRangeCallback cb, void *ctx);
+
 // Iterator
 typedef void (*KVIteratorCallback)(const char *key, Value *val, void *ctx);
 void kv_iterate(KVStore *store, KVIteratorCallback callback, void *ctx);

@@ -29,6 +29,32 @@ typedef enum {
     TOKEN_KW_PRIMARY,
     TOKEN_KW_KEY,
     TOKEN_KW_GIRAO, // DROP
+    TOKEN_KW_MANGWAO, // GET (NoSQL)
+    TOKEN_KW_HATAO,   // DELETE (NoSQL)
+    TOKEN_KW_CHECKPOINT, // Manual Snapshot
+
+    TOKEN_KW_INDEX, // INDEX
+    TOKEN_KW_ON,    // ON
+
+    // Auth & System
+    TOKEN_KW_CREATE,  // CREATE
+    TOKEN_KW_USER,    // USER
+    TOKEN_KW_PASSWORD, // PASSWORD
+    TOKEN_KW_DATABASE, // DATABASE
+    TOKEN_KW_show,     // SHOW
+    TOKEN_KW_TABLES,   // TABLES
+    TOKEN_KW_USE,      // USE
+
+    // Logical & Grouping (Step 10)
+    TOKEN_KW_AND,      // AUR
+    TOKEN_KW_OR,       // YA
+    TOKEN_KW_GROUP,    // SAMOOH
+    TOKEN_KW_BY,       // DWARA
+    TOKEN_KW_COUNT,    // GINO
+    TOKEN_KW_SUM,      // JODO
+    TOKEN_KW_AVG,      // AUSAAT
+    TOKEN_KW_MIN,      // SABSE_CHOTA
+    TOKEN_KW_MAX,      // SABSE_BADA
 
     // Symbols
     TOKEN_LPAREN,
@@ -40,7 +66,8 @@ typedef enum {
     TOKEN_SEMICOLON,
     TOKEN_LBRACE,
     TOKEN_RBRACE,
-    TOKEN_COLON
+    TOKEN_COLON,
+    TOKEN_STAR // *
 } LexerTokenType;
 
 typedef struct {

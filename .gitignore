@@ -11,5 +11,15 @@ inventix-server
 *.snap
 *.db
 
+# Test Files & Artifacts
+check.sql
+test_*.sql
+test_*.txt
+stress_test.txt
+src/test_*.c
+src/test_*.o
+test_btree.exe
+test_btree
+
 # VS Code
 .vscode/

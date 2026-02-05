@@ -4,6 +4,11 @@
 #include "parser.h"
 #include "storage.h"
 
-void execute_query(ASTNode *node, KVStore *store, FILE *out);
+typedef struct {
+    char current_db[64];
+    char current_user[64];
+} SessionContext;
+
+void execute_query(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out);
 
 #endif

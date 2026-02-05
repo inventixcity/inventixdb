@@ -57,10 +57,92 @@ ASTNode* create_node(ASTNodeType type) {
 
 // Parsing Functions
 
-// 1. Create Table: TABLE banao name (cols...)
+// 11. Create Index: CREATE INDEX ON table (col)
+ASTNode* parse_create_table(ParserContext *ctx); // Fwd Decl
+
+ASTNode* parse_create_user(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_USER, "Expected 'USER'");
+    
+    if (current_token(ctx)->type == TOKEN_KW_BANAO) {
+         consume(ctx, TOKEN_KW_BANAO, "BANAO");
+    }
+
+    Token *usr = consume(ctx, TOKEN_IDENTIFIER, "Username");
+    
+    // Check for WITH PASSWORD or just PASSWORD
+    consume(ctx, TOKEN_KW_PASSWORD, "Expected 'PASSWORD'");
+    Token *pw = consume(ctx, TOKEN_STRING, "Password String");
+    
+    ASTNode *node = create_node(NODE_CMD_CREATE_USER);
+    node->data.create_user.username = strdup(usr->value);
+    node->data.create_user.password = strdup(pw->value);
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_create_db(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_DATABASE, "Expected 'DATABASE'");
+    
+    if (current_token(ctx)->type == TOKEN_KW_BANAO) {
+         consume(ctx, TOKEN_KW_BANAO, "BANAO");
+    }
+
+    Token *db = consume(ctx, TOKEN_IDENTIFIER, "Database Name");
+    
+    ASTNode *node = create_node(NODE_CMD_CREATE_DB);
+    node->data.create_db.db_name = strdup(db->value);
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_show_tables(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_show, "Expected 'SHOW'");
+    consume(ctx, TOKEN_KW_TABLES, "Expected 'TABLES'");
+    
+    ASTNode *node = create_node(NODE_CMD_SHOW_TABLES);
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_create_index(ParserContext *ctx) {
+    if (current_token(ctx)->type != TOKEN_KW_INDEX) {
+         // Should be here if called from CREATE handler
+         consume(ctx, TOKEN_KW_INDEX, "Expected 'INDEX'");
+    } else {
+         consume(ctx, TOKEN_KW_INDEX, "Expected 'INDEX'");
+    }
+
+    consume(ctx, TOKEN_KW_ON, "Expected 'ON'");
+    
+    ASTNode *node = create_node(NODE_CMD_CREATE_INDEX);
+    Token *tbl = consume(ctx, TOKEN_IDENTIFIER, "Table Name");
+    node->data.create_index.table_name = strdup(tbl->value);
+    
+    consume(ctx, TOKEN_LPAREN, "(");
+    Token *col = consume(ctx, TOKEN_IDENTIFIER, "Column Name");
+    node->data.create_index.col_name = strdup(col->value);
+    consume(ctx, TOKEN_RPAREN, ")");
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+// 1. Create Table: TABLE banao name (cols...) OR CREATE TABLE name ...
 ASTNode* parse_create_table(ParserContext *ctx) {
-    consume(ctx, TOKEN_KW_TABLE, "Expected 'TABLE'");
-    consume(ctx, TOKEN_KW_BANAO, "Expected 'banao'");
+    // If we came from 'CREATE', we might have consumed 'CREATE', and current is 'TABLE'.
+    // If we came from 'TABLE BANAO', current is 'TABLE'.
+    
+    if (current_token(ctx)->type == TOKEN_KW_TABLE) {
+        consume(ctx, TOKEN_KW_TABLE, "Expected 'TABLE'");
+    }
+
+    // Hinglish 'BANAO' check (Optional for standard SQL)
+    if (current_token(ctx)->type == TOKEN_KW_BANAO) {
+        consume(ctx, TOKEN_KW_BANAO, "Expected 'banao'");
+    }
     
     ASTNode *node = create_node(NODE_CMD_CREATE_TABLE);
     Token *name = consume(ctx, TOKEN_IDENTIFIER, "Expected table name");
@@ -118,59 +200,92 @@ ASTNode* parse_create_table(ParserContext *ctx) {
     return node;
 }
 
-// 2. Insert: INSERT karo table VALUES (...)
+// 2. Insert: INSERT [karo] [INTO] table VALUES (...)
 ASTNode* parse_insert(ParserContext *ctx) {
-    consume(ctx, TOKEN_KW_INSERT, "Expected 'INSERT'");
-    consume(ctx, TOKEN_KW_KARO, "Expected 'karo'");
+    consume(ctx, TOKEN_KW_INSERT, "Expected 'INSERT' or 'DAALO'");
+    
+    // Optional 'INTO' (Not tokenized explicitly, treated as identifier if we aren't careful)
+    // Actually, SQL standard is INSERT INTO.
+    // Lexer doesn't have INTO. It will be IDENTIFIER "INTO".
+    // Hinglish "INSERT KARO".
+    
+    if (current_token(ctx)->type == TOKEN_KW_KARO) {
+        consume(ctx, TOKEN_KW_KARO, "Expected 'karo'");
+    } else if (current_token(ctx)->type == TOKEN_IDENTIFIER && strcasecmp(current_token(ctx)->value, "INTO") == 0) {
+        consume(ctx, TOKEN_IDENTIFIER, "INTO");
+    }
+
     ASTNode *node = create_node(NODE_CMD_INSERT);
     
     Token *name = consume(ctx, TOKEN_IDENTIFIER, "Expected table name");
     node->data.insert.table_name = strdup(name->value);
 
-    consume(ctx, TOKEN_KW_VALUES, "Expected 'VALUES'");
-    consume(ctx, TOKEN_LPAREN, "Expected '('");
+    consume(ctx, TOKEN_KW_VALUES, "Expected 'VALUES' or 'MAAN'");
 
-    NodeList *head = NULL;
-    NodeList *tail = NULL;
+// Loop for Multi-Row Values: (1, 'A'), (2, 'B'), ...
+    RowValueList *row_head = NULL;
+    RowValueList *row_tail = NULL;
+    int row_active = 1;
 
-    int active = 1;
-    while (active) {
-        Token *val = NULL;
-        int isAuto = 0;
-        if (current_token(ctx)->type == TOKEN_STRING) val = consume(ctx, TOKEN_STRING, "Value");
-        else if (current_token(ctx)->type == TOKEN_INT_LITERAL) val = consume(ctx, TOKEN_INT_LITERAL, "Value");
-        else if (current_token(ctx)->type == TOKEN_FLOAT_LITERAL) val = consume(ctx, TOKEN_FLOAT_LITERAL, "Value");
-        else if (current_token(ctx)->type == TOKEN_KW_AUTO) {
-             val = consume(ctx, TOKEN_KW_AUTO, "Auto");
-             isAuto = 1;
+    while (row_active) {
+        consume(ctx, TOKEN_LPAREN, "Expected '('");
+        
+        // Parse One Row
+        NodeList *head = NULL;
+        NodeList *tail = NULL;
+        int active = 1;
+        while (active) {
+            Token *val = NULL;
+            int isAuto = 0;
+            if (current_token(ctx)->type == TOKEN_STRING) val = consume(ctx, TOKEN_STRING, "Value");
+            else if (current_token(ctx)->type == TOKEN_INT_LITERAL) val = consume(ctx, TOKEN_INT_LITERAL, "Value");
+            else if (current_token(ctx)->type == TOKEN_FLOAT_LITERAL) val = consume(ctx, TOKEN_FLOAT_LITERAL, "Value");
+            else if (current_token(ctx)->type == TOKEN_KW_AUTO) {
+                 val = consume(ctx, TOKEN_KW_AUTO, "Auto");
+                 isAuto = 1;
+            }
+            else {
+                 printf("Error: Expected literal value or AUTO\n"); 
+                 longjmp(ctx->env, 1);
+            }
+
+            NodeList *item = malloc(sizeof(NodeList));
+            item->value = strdup(isAuto ? "AUTO" : val->value);
+            item->next = NULL;
+
+            if (!head) head = item;
+            else tail->next = item;
+            tail = item;
+
+            if (match(ctx, TOKEN_COMMA)) continue;
+            else active = 0;
         }
-        else {
-             printf("Error: Expected literal value or AUTO\n"); 
-             longjmp(ctx->env, 1);
-        }
-
-        NodeList *item = malloc(sizeof(NodeList));
-        item->value = strdup(isAuto ? "AUTO" : val->value);
-        item->next = NULL;
-
-        if (!head) head = item;
-        else tail->next = item;
-        tail = item;
+        consume(ctx, TOKEN_RPAREN, "Expected ')'");
+        
+        RowValueList *row = malloc(sizeof(RowValueList));
+        row->values = head;
+        row->next = NULL;
+        if (!row_head) row_head = row;
+        else row_tail->next = row;
+        row_tail = row;
 
         if (match(ctx, TOKEN_COMMA)) continue;
-        else active = 0;
+        else row_active = 0;
     }
-    node->data.insert.values = head;
+    
+    node->data.insert.rows = row_head;
 
-    consume(ctx, TOKEN_RPAREN, "Expected ')'");
     consume(ctx, TOKEN_SEMICOLON, "Expected ';'");
     return node;
 }
 
-// 3. Select: SELECT cols FROM table [JAHAN expr]
+// 3. Select: SELECT cols FROM table [JAHAN expr] [SAMOOH DWARA col]
 ASTNode* parse_select(ParserContext *ctx, int is_subquery) {
-    consume(ctx, TOKEN_KW_SELECT, "Expected 'SELECT'");
-    // Removed strict requirement for 'KARO' in SELECT to match user expectation (Syntax Step 1)
+    if (current_token(ctx)->type == TOKEN_KW_DHUNDO)
+        consume(ctx, TOKEN_KW_DHUNDO, "Expected 'DHUNDO'");
+    else
+        consume(ctx, TOKEN_KW_SELECT, "Expected 'SELECT'");
+
     if (current_token(ctx)->type == TOKEN_KW_KARO) {
         consume(ctx, TOKEN_KW_KARO, "Expected 'karo'");
     }
@@ -181,22 +296,45 @@ ASTNode* parse_select(ParserContext *ctx, int is_subquery) {
     NodeList *head = NULL;
     NodeList *tail = NULL;
     
-    // Check for * (not explicitly tokenized as STAR, but let's assume * is allowed or only identifiers)
-    // My lexer doesn't have STAR token. Using "IDENTIFIER" for now or assume user types columns.
-    // Let's assume user must type list of cols.
-    
-    int active = 1;
-    while (active) {
-        Token *col = consume(ctx, TOKEN_IDENTIFIER, "Expected column name");
+    if (current_token(ctx)->type == TOKEN_STAR) {
+        consume(ctx, TOKEN_STAR, "*");
         NodeList *item = malloc(sizeof(NodeList));
-        item->value = strdup(col->value);
+        item->value = strdup("*");
+        item->func_type = 0;
         item->next = NULL;
-        if (!head) head = item;
-        else tail->next = item;
-        tail = item;
+        head = item;
+    } else {
+        int active = 1;
+        while (active) {
+            // Check for Aggregates: COUNT(col)
+            int func = 0;
+            if (current_token(ctx)->type == TOKEN_KW_COUNT) { consume(ctx, TOKEN_KW_COUNT, "COUNT"); func = 1; consume(ctx, TOKEN_LPAREN, "("); }
+            else if (current_token(ctx)->type == TOKEN_KW_SUM) { consume(ctx, TOKEN_KW_SUM, "SUM"); func = 2; consume(ctx, TOKEN_LPAREN, "("); }
+            else if (current_token(ctx)->type == TOKEN_KW_AVG) { consume(ctx, TOKEN_KW_AVG, "AVG"); func = 3; consume(ctx, TOKEN_LPAREN, "("); }
+            else if (current_token(ctx)->type == TOKEN_KW_MAX) { consume(ctx, TOKEN_KW_MAX, "MAX"); func = 4; consume(ctx, TOKEN_LPAREN, "("); }
+            else if (current_token(ctx)->type == TOKEN_KW_MIN) { consume(ctx, TOKEN_KW_MIN, "MIN"); func = 5; consume(ctx, TOKEN_LPAREN, "("); }
+            
+            Token *col = NULL; 
+            if (func == 1 && current_token(ctx)->type == TOKEN_STAR) {
+                consume(ctx, TOKEN_STAR, "*");
+                col = malloc(sizeof(Token)); col->value = "*"; // Hack
+            } else {
+                col = consume(ctx, TOKEN_IDENTIFIER, "Expected column name");
+            }
 
-        if (match(ctx, TOKEN_COMMA)) continue;
-        else active = 0;
+            if (func > 0) consume(ctx, TOKEN_RPAREN, ")");
+
+            NodeList *item = malloc(sizeof(NodeList));
+            item->value = strdup(col->value);
+            item->func_type = func;
+            item->next = NULL;
+            if (!head) head = item;
+            else tail->next = item;
+            tail = item;
+    
+            if (match(ctx, TOKEN_COMMA)) continue;
+            else active = 0;
+        }
     }
     node->data.select.columns = head;
 
@@ -208,6 +346,17 @@ ASTNode* parse_select(ParserContext *ctx, int is_subquery) {
     if (match(ctx, TOKEN_KW_JAHAN)) {
         node->data.select.where_clause = parse_expression(ctx);
     }
+    
+    // Optional GROUP BY (SAMOOH DWARA)
+    if (match(ctx, TOKEN_KW_GROUP)) {
+        consume(ctx, TOKEN_KW_BY, "Expected 'BY/DWARA'");
+        // Single column grouping for now
+        Token *gcol = consume(ctx, TOKEN_IDENTIFIER, "Group Column");
+        NodeList *g = malloc(sizeof(NodeList));
+        g->value = strdup(gcol->value);
+        g->next = NULL;
+        node->data.select.group_by = g;
+    }
 
     if (!is_subquery) {
         consume(ctx, TOKEN_SEMICOLON, "Expected ';'");
@@ -215,8 +364,59 @@ ASTNode* parse_select(ParserContext *ctx, int is_subquery) {
     return node;
 }
 
-// 4. Expression: col OP value OR col OP (Subquery)
+// Forward decl
+ASTNode* parse_logical_or(ParserContext *ctx);
+
+// Main Entry for Expression Parsing (Lowest Precedence)
 ASTNode* parse_expression(ParserContext *ctx) {
+    return parse_logical_or(ctx);
+}
+
+// Parse Logical AND (Higher Precedence than OR)
+ ASTNode* parse_comparison(ParserContext *ctx);
+
+ASTNode* parse_logical_and(ParserContext *ctx) {
+    ASTNode *left = parse_comparison(ctx);
+
+    while (current_token(ctx)->type == TOKEN_KW_AND) {
+        consume(ctx, TOKEN_KW_AND, "AND");
+        ASTNode *right = parse_comparison(ctx);
+        
+        ASTNode *node = create_node(NODE_EXPR_BINARY); // Reusing BINARY for logical
+        node->data.binary_expr.left = left;
+        node->data.binary_expr.right = right;
+        node->data.binary_expr.op = strdup("AND");
+        left = node;
+    }
+    return left;
+}
+
+// Parse Logical OR
+ASTNode* parse_logical_or(ParserContext *ctx) {
+    ASTNode *left = parse_logical_and(ctx);
+
+    while (current_token(ctx)->type == TOKEN_KW_OR) {
+        consume(ctx, TOKEN_KW_OR, "OR");
+        ASTNode *right = parse_logical_and(ctx);
+        
+        ASTNode *node = create_node(NODE_EXPR_BINARY);
+        node->data.binary_expr.left = left;
+        node->data.binary_expr.right = right;
+        node->data.binary_expr.op = strdup("OR");
+        left = node;
+    }
+    return left;
+}
+
+// 4. Comparison: col OP value (Highest Precedence)
+ASTNode* parse_comparison(ParserContext *ctx) {
+    // Parenthesis check first
+    if (match(ctx, TOKEN_LPAREN)) {
+        ASTNode *node = parse_expression(ctx);
+        consume(ctx, TOKEN_RPAREN, ")");
+        return node;
+    }
+
     ASTNode *node = create_node(NODE_EXPR_BINARY);
     
     // Left: Identifier
@@ -348,8 +548,82 @@ ASTNode* parse_drop_table(ParserContext *ctx) {
     return node;
 }
 
+// 8. Doc Get: MANGWAO collection [id]
+ASTNode* parse_doc_get(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_MANGWAO, "MANGWAO");
+    ASTNode *node = create_node(NODE_CMD_DOC_GET);
+    
+    Token *col = consume(ctx, TOKEN_IDENTIFIER, "Collection Name");
+    node->data.doc_get.collection = strdup(col->value);
+    
+    // Optional ID (String or Int)
+    if (current_token(ctx)->type == TOKEN_STRING) {
+        Token *val = consume(ctx, TOKEN_STRING, "ID");
+        node->data.doc_get.doc_id = strdup(val->value);
+    } else if (current_token(ctx)->type == TOKEN_INT_LITERAL) {
+         Token *val = consume(ctx, TOKEN_INT_LITERAL, "ID");
+         node->data.doc_get.doc_id = strdup(val->value);
+    } else {
+        node->data.doc_get.doc_id = NULL; // Get All
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+// 9. Doc Remove: HATAO collection id
+ASTNode* parse_doc_remove(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_HATAO, "HATAO");
+    ASTNode *node = create_node(NODE_CMD_DOC_REMOVE);
+    
+    Token *col = consume(ctx, TOKEN_IDENTIFIER, "Collection Name");
+    node->data.doc_remove.collection = strdup(col->value);
+    
+    // ID is mandatory for now? Or allow delete all?
+    // Let's enforce ID for safety "like deleteOne"
+    // "HATAO user 1"
+    
+    if (current_token(ctx)->type == TOKEN_STRING) {
+        Token *val = consume(ctx, TOKEN_STRING, "ID");
+        node->data.doc_remove.doc_id = strdup(val->value);
+    } else if (current_token(ctx)->type == TOKEN_INT_LITERAL) {
+         Token *val = consume(ctx, TOKEN_INT_LITERAL, "ID");
+         node->data.doc_remove.doc_id = strdup(val->value);
+    } else {
+         printf("Error: Expected Document ID (String or Int)\n");
+         longjmp(ctx->env, 1);
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_checkpoint(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_CHECKPOINT, "CHECKPOINT");
+    ASTNode *node = create_node(NODE_CMD_CHECKPOINT);
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_use_db(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_USE, "USE");
+    ASTNode *node = malloc(sizeof(ASTNode)); // Explicit malloc to be safe
+    node->type = NODE_CMD_USE_DB;
+    
+    // Allow 'DATABASE' optional
+    if (current_token(ctx)->type == TOKEN_KW_DATABASE) advance(ctx);
+    
+    node->data.use_db.db_name = strdup(current_token(ctx)->value);
+    consume(ctx, TOKEN_IDENTIFIER, "database name");
+    if (current_token(ctx)->type == TOKEN_SEMICOLON) advance(ctx);
+    return node;
+}
+
 ASTNode* parse(TokenList *tokens) {
-    ParserContext ctx = { tokens, 0 };
+    ParserContext ctx;
+    ctx.tokens = tokens;
+    ctx.current = 0;
+    // ctx.env is initialized by setjmp below
     
     if (setjmp(ctx.env) != 0) {
         // Error occurred
@@ -357,6 +631,38 @@ ASTNode* parse(TokenList *tokens) {
     }
 
     Token *t = current_token(&ctx);
+
+    if (t->type == TOKEN_KW_USE) return parse_use_db(&ctx);
+
+    // SQL Standard CREATE HANDLING or Hinglish BANAO prefix
+    if (t->type == TOKEN_KW_CREATE || t->type == TOKEN_KW_BANAO) {
+        if (t->type == TOKEN_KW_CREATE) consume(&ctx, TOKEN_KW_CREATE, "CREATE"); 
+        else consume(&ctx, TOKEN_KW_BANAO, "BANAO");
+        
+        // Look ahead
+        if (current_token(&ctx)->type == TOKEN_KW_INDEX) return parse_create_index(&ctx);
+        if (current_token(&ctx)->type == TOKEN_KW_USER) return parse_create_user(&ctx);
+        if (current_token(&ctx)->type == TOKEN_KW_DATABASE) return parse_create_db(&ctx);
+        // Table?
+        if (current_token(&ctx)->type == TOKEN_KW_TABLE) return parse_create_table(&ctx);
+        
+        // If simply 'BANAO name ...' (Implicit table creation? No, stay strict)
+        printf("Error: CREATE/BANAO [INDEX|USER|DATABASE|TABLE] expected.\n"); 
+        return NULL;
+    }
+    
+    if (t->type == TOKEN_KW_show) {
+        return parse_show_tables(&ctx);
+    }
+
+    if (t->type == TOKEN_KW_KEY) { 
+        // Handles 'PRIMARY KEY' if weirdly starts? No.
+        printf("Unexpected KEY token\n"); return NULL; 
+    }
+    
+    // Hinglish direct Object-Verb starts
+    if (t->type == TOKEN_KW_USER) return parse_create_user(&ctx);
+    if (t->type == TOKEN_KW_DATABASE) return parse_create_db(&ctx);
 
     if (t->type == TOKEN_KW_TABLE) {
         // Check next token to distinguish CREATE vs DROP
@@ -367,12 +673,32 @@ ASTNode* parse(TokenList *tokens) {
         return parse_create_table(&ctx);
     } else if (t->type == TOKEN_KW_INSERT) {
         return parse_insert(&ctx);
-    } else if (t->type == TOKEN_KW_SELECT) {
+    } else if (t->type == TOKEN_KW_SELECT || t->type == TOKEN_KW_DHUNDO) {
         return parse_select(&ctx, 0);
     } else if (t->type == TOKEN_KW_RAKHO) {
         return parse_doc_insert(&ctx);
+    } else if (t->type == TOKEN_KW_MANGWAO) {
+        return parse_doc_get(&ctx);
+    } else if (t->type == TOKEN_KW_HATAO) {
+        return parse_doc_remove(&ctx);
     } else if (t->type == TOKEN_KW_NIKALO) {
         return parse_delete(&ctx);
+    } else if (t->type == TOKEN_KW_CHECKPOINT) {
+        return parse_checkpoint(&ctx);
+    } else if (t->type == TOKEN_KW_INDEX) {
+        // "INDEX ON ..."
+        return parse_create_index(&ctx); 
+    } else if (t->type == TOKEN_IDENTIFIER && strcasecmp(t->value, "CREATE") == 0) {
+        // Handle standard SQL "CREATE INDEX"
+        consume(&ctx, TOKEN_IDENTIFIER, "CREATE");
+        // Next token should be INDEX
+        if (current_token(&ctx)->type == TOKEN_KW_INDEX) {
+             // Let parse_create_index consume it
+             return parse_create_index(&ctx);
+        } else {
+             printf("Error: Expected INDEX after CREATE\n");
+             return NULL;
+        }
     } else {
         printf("Unknown command or unexpected token: %s\n", t->value);
         return NULL;
@@ -395,13 +721,32 @@ void print_node(ASTNode *node, int level) {
                 printf("Col: %s (%s)\n", node->data.create_table.columns[i].name, node->data.create_table.columns[i].type);
             }
             break;
+        case NODE_CMD_CREATE_USER:
+             printf("CREATE USER: %s\n", node->data.create_user.username);
+             break;
+        case NODE_CMD_CREATE_DB:
+             printf("CREATE DATABASE: %s\n", node->data.create_db.db_name);
+             break;
+        case NODE_CMD_SHOW_TABLES:
+             printf("SHOW TABLES\n");
+             break;
+        case NODE_CMD_USE_DB:
+             printf("USE DB: %s\n", node->data.use_db.db_name);
+             break;
         case NODE_CMD_INSERT:
             printf("INSERT INTO: %s\n", node->data.insert.table_name);
-            NodeList *cur = node->data.insert.values;
-            while(cur) {
+            RowValueList *row = node->data.insert.rows;
+            int r = 1;
+            while(row) {
                 print_indent(level+1);
-                printf("Val: %s\n", cur->value);
-                cur = cur->next;
+                printf("Row %d:\n", r++);
+                NodeList *cur = row->values;
+                while(cur) {
+                    print_indent(level+2);
+                    printf("Val: %s\n", cur->value);
+                    cur = cur->next;
+                }
+                row = row->next;
             }
             break;
         case NODE_CMD_SELECT:
@@ -430,11 +775,86 @@ void print_node(ASTNode *node, int level) {
         case NODE_CMD_DOC_INSERT:
             printf("DOC INSERT: %s values %s\n", node->data.doc_insert.collection, node->data.doc_insert.json_body);
             break;
+        case NODE_CMD_DOC_GET:
+            printf("DOC GET: %s (ID: %s)\n", node->data.doc_get.collection, node->data.doc_get.doc_id ? node->data.doc_get.doc_id : "ALL");
+            break;
+        case NODE_CMD_DOC_REMOVE:
+            printf("DOC REMOVE: %s (ID: %s)\n", node->data.doc_remove.collection, node->data.doc_remove.doc_id);
+            break;
         default:
             printf("Unknown Node Type %d\n", node->type);
     }
 }
 
+void free_node_list(NodeList *list) {
+    while (list) {
+        NodeList *next = list->next;
+        if (list->value) free(list->value);
+        if (list->alias) free(list->alias);
+        free(list);
+        list = next;
+    }
+}
+
+void free_row_list(RowValueList *rows) {
+    while(rows) {
+        RowValueList *next = rows->next;
+        free_node_list(rows->values);
+        free(rows);
+        rows = next;
+    }
+}
+
+void free_ast(ASTNode *node) {
+    if (!node) return;
+    
+    switch(node->type) {
+        case NODE_CMD_CREATE_TABLE:
+            free(node->data.create_table.table_name);
+            for(int i=0; i<node->data.create_table.col_count; i++) {
+                free(node->data.create_table.columns[i].name);
+                free(node->data.create_table.columns[i].type);
+            }
+            free(node->data.create_table.columns);
+            break;
+        case NODE_CMD_INSERT:
+            free(node->data.insert.table_name);
+            free_row_list(node->data.insert.rows);
+            break;
+        case NODE_CMD_SELECT:
+            free(node->data.select.table_name);
+            free_node_list(node->data.select.columns);
+            free_node_list(node->data.select.group_by);
+            free_ast(node->data.select.where_clause);
+            break;
+        case NODE_EXPR_BINARY:
+            free(node->data.binary_expr.op);
+            free_ast(node->data.binary_expr.left);
+            free_ast(node->data.binary_expr.right);
+            break;
+        case NODE_EXPR_LOGICAL: // Reuses binary structure in union? 
+            // Currently logical nodes are NODE_EXPR_BINARY with op="AND"
+            // If they were distinct, we'd handle them here.
+            break; 
+        case NODE_EXPR_SUBQUERY:
+            free_ast(node->data.subquery.subquery_stmt);
+            break;
+        case NODE_EXPR_IDENTIFIER:
+        case NODE_EXPR_LITERAL:
+            free(node->data.literal.value);
+            break;
+        // ... Add other cases as needed ...
+        default:
+            // Minimal cleanup for string types that are just pointers not deep structs
+            break;
+    }
+    
+    free(node);
+}
+
+void print_node(ASTNode *node, int level); // Fwd decl
+
 void print_ast(ASTNode *node) {
+    if (!node) return;
     print_node(node, 0);
 }

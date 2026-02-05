@@ -25,6 +25,11 @@ void *client_handler(void *socket_desc) {
     int sock = *(int*)socket_desc;
     free(socket_desc);
     
+    // Per-client Session Context
+    SessionContext ctx;
+    strcpy(ctx.current_db, "public");
+    strcpy(ctx.current_user, "guest");
+    
     char buffer[BUFFER_SIZE];
     int read_size;
     
@@ -55,9 +60,13 @@ void *client_handler(void *socket_desc) {
                     } else {
                         // Local Execution (Worker or Standalone)
                         FILE *fp = tmpfile(); 
-                        if (!fp) fp = fopen("temp_output.txt", "w+");
+                        if (!fp) {
+                             char tname[32];
+                             sprintf(tname, "tmp_%d.out", sock);
+                             fp = fopen(tname, "w+");
+                        }
                         
-                        execute_query(ast, global_store, fp);
+                        execute_query(ast, global_store, &ctx, fp);
                         
                         fseek(fp, 0, SEEK_SET);
                         char out_buf[BUFFER_SIZE];
@@ -70,9 +79,16 @@ void *client_handler(void *socket_desc) {
                         if (!sent_something) send(sock, "OK\n", 3, 0);
                         fclose(fp);
                     }
+                    
+                    // Protocol: End Marker (for distributed parsing)
+                    // Master needs to know when Worker is done.
+                    // Client doesn't strictly need it but it helps consistency.
+                    send(sock, "<<EOF>>\n", 8, 0);
+
                 } else {
                     char *msg = "Error: Failed to parse.\n";
                     send(sock, msg, strlen(msg), 0);
+                    send(sock, "<<EOF>>\n", 8, 0);
                 }
             }
             free_token_list(tokens);
@@ -132,13 +148,14 @@ int main(int argc, char *argv[]) {
     server.sin_port = htons(g_port);
 
     if(bind(server_fd,(struct sockaddr *)&server , sizeof(server)) == SOCKET_ERROR) {
-        printf("Bind failed with error code : %d", WSAGetLastError());
+        printf("Bind failed with error code : %d\n", WSAGetLastError());
         return 1;
     }
     
     listen(server_fd , 3);
 
     printf("InventixDB Server (%s) started on port %d\n", dist_is_master() ? "MASTER" : "WORKER", g_port);
+    printf("Partitioning: Hash-Based | Workers: 2 (Ports 8889, 8890)\n");
     
     c = sizeof(struct sockaddr_in);
     
