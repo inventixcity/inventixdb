@@ -10,6 +10,8 @@ InventixDB is a custom, mini distributed database system implemented in C. It fe
 
 ## System Architecture
 
+![System Architecture](docs/image.png)
+
 The system follows a layered architecture designed for modularity and distributed data handling.
 
 ### Architecture Overview
