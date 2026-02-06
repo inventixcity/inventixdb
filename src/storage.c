@@ -4,11 +4,25 @@
 #include <pthread.h>
 #include "storage.h"
 #include "btree.h"  // Integration: Include B+ Tree
+#include "config.h" // Configuration System
+#include "logger.h" // Logging System
 
-#define INITIAL_CAPACITY 1024
-#define LOG_FILE "inventix.log"
-#define SNAP_FILE "inventix.snap"
-#define CHECKPOINT_THRESHOLD (2 * 1024 * 1024) // 2MB
+// Configuration-based values - using helper functions for string paths
+static int get_initial_capacity() {
+    return g_config.config_loaded ? CFG_STORAGE.initial_capacity : 1024;
+}
+
+static const char* get_log_file() {
+    return g_config.config_loaded ? CFG_STORAGE.log_file : "inventix.log";
+}
+
+static const char* get_snap_file() {
+    return g_config.config_loaded ? CFG_STORAGE.snap_file : "inventix.snap";
+}
+
+static int get_checkpoint_threshold() {
+    return g_config.config_loaded ? (CFG_STORAGE.checkpoint_threshold_kb * 1024) : (2 * 1024 * 1024);
+}
 
 typedef struct {
     char *key;
@@ -35,7 +49,8 @@ struct KVStore {
 // STORAGE ENGINE WITH SKIP LIST INDEX
 // ---------------------------------------------------------
 
-#define MAX_LEVEL 6
+// MAX_LEVEL from config (default 6 if not loaded)
+#define MAX_LEVEL (g_config.config_loaded ? CFG_STORAGE.skip_list_max_level : 6)
 
 typedef struct SkipNode {
     char *value; // Indexed Value (e.g. "Ali")
@@ -232,8 +247,8 @@ void kv_append_log(KVStore *store, int op_type, const char *key, void *data, siz
     fflush(store->log_fp);
 
     // Auto Checkpoint logic
-    if (store->log_size > CHECKPOINT_THRESHOLD) {
-        printf("[Storage] Auto-Checkpoint triggered (Log Size: %ld)\n", store->log_size);
+    if (store->log_size > get_checkpoint_threshold()) {
+        LOG_STORAGE(LOG_LEVEL_INFO, "Auto-Checkpoint triggered (Log Size: %ld bytes)", store->log_size);
         kv_snapshot_internal(store);
     }
 }
@@ -371,8 +386,13 @@ void kv_snapshot_internal(KVStore *store) {
         store->log_fp = NULL;
     }
     
-    // Write tmp file first for atomic rename (Production Style)
-    FILE *snap = fopen(SNAP_FILE ".tmp", "wb");
+    // Get file paths from config
+    const char *snap_path = get_snap_file();
+    char snap_tmp[512];
+    snprintf(snap_tmp, sizeof(snap_tmp), "%s.tmp", snap_path);
+    
+    // Write tmp file first for atomic rename
+    FILE *snap = fopen(snap_tmp, "wb");
     if (!snap) {
          return;
     }
@@ -400,13 +420,14 @@ void kv_snapshot_internal(KVStore *store) {
     fclose(snap);
     
     // Atomic Swap
-    remove(SNAP_FILE);
-    rename(SNAP_FILE ".tmp", SNAP_FILE);
+    remove(snap_path);
+    rename(snap_tmp, snap_path);
     
     // Reset Log
-    store->log_fp = fopen(LOG_FILE, "wb"); 
+    const char *log_path = get_log_file();
+    store->log_fp = fopen(log_path, "wb"); 
     fclose(store->log_fp);
-    store->log_fp = fopen(LOG_FILE, "ab"); 
+    store->log_fp = fopen(log_path, "ab"); 
     store->log_size = 0; // Reset Auto-Checkpoint counter
 }
 
@@ -418,9 +439,10 @@ void kv_snapshot(KVStore *store) {
 
 void kv_recover(KVStore *store) {
     // 1. Load Snapshot
-    FILE *snap = fopen(SNAP_FILE, "rb");
+    const char *snap_path = get_snap_file();
+    FILE *snap = fopen(snap_path, "rb");
     if (snap) {
-        printf("Loading snapshot...\n");
+        LOG_STORAGE(LOG_LEVEL_INFO, "Loading snapshot from %s", snap_path);
         int count;
         if (fread(&count, sizeof(int), 1, snap) > 0) {
             for(int i=0; i<count; i++) {
@@ -448,9 +470,10 @@ void kv_recover(KVStore *store) {
     }
 
     // 2. Replay Log
-    FILE *log = fopen(LOG_FILE, "rb");
+    const char *log_path = get_log_file();
+    FILE *log = fopen(log_path, "rb");
     if (log) {
-        printf("Replaying log...\n");
+        LOG_STORAGE(LOG_LEVEL_INFO, "Replaying WAL from %s", log_path);
         while(1) {
             int op = fgetc(log);
             if (op == EOF) break;
@@ -494,7 +517,7 @@ void kv_recover(KVStore *store) {
 
 KVStore* kv_create() {
     KVStore *store = malloc(sizeof(KVStore));
-    store->capacity = INITIAL_CAPACITY;
+    store->capacity = get_initial_capacity();
     store->count = 0;
     store->entries = calloc(store->capacity, sizeof(KVEntry));
     store->indexes = NULL;
@@ -509,7 +532,7 @@ KVStore* kv_create() {
     // kv_recover opens log for appending at the end. 
     // If kv_recover didn't run (fresh), we need to handle it.
     if (!store->log_fp) {
-        store->log_fp = fopen(LOG_FILE, "a"); // Ensure open
+        store->log_fp = fopen(get_log_file(), "a"); // Ensure open
         store->log_size = 0;
     }
 

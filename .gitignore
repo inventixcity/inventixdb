@@ -5,6 +5,22 @@
 *.exe
 inventixdb
 inventix-server
+inventix-client
+test_btree
+test_runner
+test_memory
+test_network
+test_crash_recovery
+
+# Documentation (Local)
+local_docs/
+
+# HTML Documentation
+*.html
+docs/*.html
+
+# Text Files
+*.txt
 
 # Logs and Data
 *.log
@@ -14,12 +30,12 @@ inventix-server
 # Test Files & Artifacts
 check.sql
 test_*.sql
-test_*.txt
-stress_test.txt
+tests/
 src/test_*.c
 src/test_*.o
-test_btree.exe
-test_btree
 
 # VS Code
 .vscode/
+
+# Build artifacts
+test_crash_data/

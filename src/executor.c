@@ -6,9 +6,19 @@
 #include "auth.h"
 #include "system.h"
 #include "colors.h"
+#include "transaction.h"
+#include "logger.h"
+#include "query_result.h"
+#include "backup.h"
+#include "nosql.h"
+
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#endif
 
 // Forward decls
 void execute_select(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out);
+void execute_update(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out);
 void resolve_where_clause(ASTNode *where, KVStore *store, SessionContext *ctx); 
 void scan_callback(const char *key, Value *val, void *ctx); // Added forward decl
 
@@ -79,6 +89,10 @@ typedef struct {
     int group_by_active;
     int group_col_idx;   // Index of the column we are grouping by
     GroupBucket *groups; // Head of buckets
+    
+    // Buffered Results (for ORDER BY / LIMIT)
+    int buffer_mode;     // 0=Print Immediately, 1=Buffer to ResultSet
+    ResultSet *result_set; // Buffered result set
 } ScanContext;
 
 char* execute_scalar_subquery(ASTNode *node, KVStore *store, SessionContext *session);
@@ -395,6 +409,25 @@ void scan_callback(const char *key, Value *val, void *ctx) {
                  return;
              }
 
+            // Buffered Mode: Add to ResultSet for ORDER BY / LIMIT
+            if (scan->buffer_mode && scan->result_set) {
+                int out_cols = scan->proj_count > 0 ? scan->proj_count : count;
+                char **row_vals = malloc(out_cols * sizeof(char*));
+                for (int i = 0; i < out_cols; i++) {
+                    int col_idx = (scan->proj_count > 0) ? scan->proj_indices[i] : i;
+                    if (col_idx < count && tokens[col_idx]) {
+                        row_vals[i] = strdup(tokens[col_idx]);
+                    } else {
+                        row_vals[i] = strdup("NULL");
+                    }
+                }
+                result_set_add_row(scan->result_set, row_vals, out_cols);
+                for (int i = 0; i < out_cols; i++) free(row_vals[i]);
+                free(row_vals);
+                row_free_result(tokens, count);
+                return;
+            }
+
             // Standard Print Logic
             fprintf(scan->out, "  \033[36m| \033[0m");
             
@@ -471,6 +504,10 @@ void execute_create_table(ASTNode *node, KVStore *store, SessionContext *ctx, FI
     // Let's store schema string with :PK suffix.
     
     kv_put(store, key, schema, strlen(schema)+1, VAL_TYPE_SCHEMA);
+    
+    // Log for transaction rollback
+    TXN_LOG_CREATE_TABLE(node->data.create_table.table_name, schema);
+    
     free(key);
     
     // Initialize Auto Increment Sequence
@@ -573,6 +610,10 @@ void execute_insert(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *ou
         
         if (rowBin) {
             kv_put(store, key, rowBin, rowSize, VAL_TYPE_ROW);
+            
+            // Log for transaction rollback
+            TXN_LOG_INSERT(node->data.insert.table_name, key);
+            
             free(rowBin);
 
             // Update Indexes
@@ -640,6 +681,11 @@ void execute_select(ASTNode *node, KVStore *store, SessionContext *session, FILE
     ctx.out = out;
     ctx.scan_stop_val = NULL; 
     ctx.scan_col_idx = -1;
+    
+    // Check if buffered mode needed (ORDER BY or LIMIT present)
+    int needs_buffering = (node->data.select.order_by_count > 0 || node->data.select.limit > 0);
+    ctx.buffer_mode = needs_buffering;
+    ctx.result_set = NULL;
 
     int distinct_lookup = 0;
     char *lookup_id = NULL;
@@ -802,6 +848,19 @@ void execute_select(ASTNode *node, KVStore *store, SessionContext *session, FILE
         ctx.col_names = NULL;
     }
 
+    // Create ResultSet for buffered mode
+    if (ctx.buffer_mode) {
+        int result_col_count = ctx.proj_count > 0 ? ctx.proj_count : ctx.col_count;
+        ctx.result_set = result_set_create(result_col_count);
+        
+        // Set column names and types
+        for (int i = 0; i < result_col_count; i++) {
+            char *name = (ctx.proj_count > 0) ? ctx.proj_names[i] : ctx.col_names[i];
+            int col_idx = (ctx.proj_count > 0) ? ctx.proj_indices[i] : i;
+            char *type = (col_idx < ctx.col_count) ? ctx.col_types[col_idx] : "STRING";
+            result_set_add_column(ctx.result_set, name, type);
+        }
+    }
 
     if (distinct_lookup) {
         fprintf(out, "Execution Plan: PRIMARY KEY INDEX LOOKUP\n");
@@ -811,8 +870,26 @@ void execute_select(ASTNode *node, KVStore *store, SessionContext *session, FILE
         fprintf(out, "Execution Plan: FULL TABLE SCAN\n");
     }
 
-    // Print Header
-    if (ctx.col_names) {
+    // Print ORDER BY / LIMIT info
+    if (node->data.select.order_by_count > 0) {
+        fprintf(out, "ORDER BY: ");
+        for (int i = 0; i < node->data.select.order_by_count; i++) {
+            fprintf(out, "%s %s%s", node->data.select.order_columns[i],
+                    node->data.select.order_desc[i] ? "DESC" : "ASC",
+                    i < node->data.select.order_by_count - 1 ? ", " : "");
+        }
+        fprintf(out, "\n");
+    }
+    if (node->data.select.limit > 0) {
+        fprintf(out, "LIMIT: %d", node->data.select.limit);
+        if (node->data.select.offset > 0) {
+            fprintf(out, " OFFSET: %d", node->data.select.offset);
+        }
+        fprintf(out, "\n");
+    }
+
+    // Print header for non-buffered mode (before scan)
+    if (!ctx.buffer_mode && ctx.col_names) {
         int print_cols = ctx.proj_count > 0 ? ctx.proj_count : ctx.col_count;
         
         fprintf(out, "\n  \033[33m+");
@@ -827,15 +904,16 @@ void execute_select(ASTNode *node, KVStore *store, SessionContext *session, FILE
         fprintf(out, "\033[0m\n");
     }
 
+    // Perform scan (buffered or direct print)
     if (distinct_lookup) {
-        char *key = sys_generate_key_table(session->current_db, node->data.select.table_name, lookup_id);
-        Value *val = kv_get(store, key);
+        char *pk_key = sys_generate_key_table(session->current_db, node->data.select.table_name, lookup_id);
+        Value *val = kv_get(store, pk_key);
         if (val) {
-            scan_callback(key, val, &ctx);
-        } else {
+            scan_callback(pk_key, val, &ctx);
+        } else if (!ctx.buffer_mode) {
             fprintf(out, "  | \033[31mNo data found   \033[0m|\n");
         }
-        free(key);
+        free(pk_key);
     } else if (index_scan) {
          if (strcmp(idx_op, "=") == 0) ctx.scan_stop_val = idx_val;
          
@@ -846,23 +924,94 @@ void execute_select(ASTNode *node, KVStore *store, SessionContext *session, FILE
         kv_iterate(store, scan_callback, &ctx);
     }
     
-    if (ctx.group_by_active) {
-         print_groups(&ctx);
-         // Cleanup Groups
-         while(ctx.groups) {
-             GroupBucket *n = ctx.groups->next;
-             // free(ctx.groups->key); // Likely referenced from tokens which were freed? No, strdup in update_bucket.
-             free(ctx.groups);
-             ctx.groups = n;
-         }
-    }
+    // Handle buffered results: ORDER BY, then LIMIT, then print
+    if (ctx.buffer_mode && ctx.result_set) {
+        // Apply ORDER BY
+        if (node->data.select.order_by_count > 0) {
+            SortSpec *specs = malloc(node->data.select.order_by_count * sizeof(SortSpec));
+            for (int i = 0; i < node->data.select.order_by_count; i++) {
+                specs[i].column_name = node->data.select.order_columns[i];
+                specs[i].descending = node->data.select.order_desc[i];
+                specs[i].column_index = -1;
+                specs[i].is_numeric = 0;
+                
+                // Find column index
+                for (int j = 0; j < ctx.result_set->column_count; j++) {
+                    if (strcasecmp(node->data.select.order_columns[i], 
+                                   ctx.result_set->column_names[j]) == 0) {
+                        specs[i].column_index = j;
+                        if (ctx.result_set->column_types[j]) {
+                            char *t = ctx.result_set->column_types[j];
+                            specs[i].is_numeric = (strcasecmp(t, "INT") == 0 || 
+                                                   strcasecmp(t, "FLOAT") == 0 ||
+                                                   strcasecmp(t, "INTEGER") == 0);
+                        }
+                        break;
+                    }
+                }
+            }
+            result_set_sort_multi(ctx.result_set, specs, node->data.select.order_by_count);
+            free(specs);
+        }
         
-    // Footer line
-    if (ctx.col_names) {
-         int print_cols = ctx.proj_count > 0 ? ctx.proj_count : ctx.col_count;
-         fprintf(out, "  \033[33m+");
-         for(int i=0; i<print_cols; i++) fprintf(out, "----------------+");
-         fprintf(out, "\033[0m\n\n");
+        // Apply LIMIT / OFFSET
+        if (node->data.select.limit > 0 || node->data.select.offset > 0) {
+            result_set_limit(ctx.result_set, node->data.select.limit, node->data.select.offset);
+        }
+        
+        // Print header
+        int print_cols = ctx.result_set->column_count;
+        fprintf(out, "\n  \033[33m+");
+        for(int i=0; i<print_cols; i++) fprintf(out, "----------------+");
+        fprintf(out, "\033[0m\n  \033[36m| \033[0m");
+        for(int i=0; i<print_cols; i++) {
+            fprintf(out, "\033[1;33m%-15s \033[36m| \033[0m", ctx.result_set->column_names[i]);
+        }
+        fprintf(out, "\n  \033[33m+");
+        for(int i=0; i<print_cols; i++) fprintf(out, "----------------+");
+        fprintf(out, "\033[0m\n");
+        
+        // Print rows from ResultSet
+        ResultRow *row = ctx.result_set->rows;
+        while (row) {
+            fprintf(out, "  \033[36m| \033[0m");
+            for (int i = 0; i < print_cols; i++) {
+                char *val = (i < row->column_count && row->values[i]) ? row->values[i] : "NULL";
+                print_cell(out, val);
+            }
+            fprintf(out, "\n");
+            row = row->next;
+        }
+        
+        // Print footer
+        fprintf(out, "  \033[33m+");
+        for(int i=0; i<print_cols; i++) fprintf(out, "----------------+");
+        fprintf(out, "\033[0m\n");
+        fprintf(out, "%d row(s) in set\n\n", ctx.result_set->row_count);
+        
+        // Free ResultSet
+        result_set_free(ctx.result_set);
+        ctx.result_set = NULL;
+    } else {
+        // Non-buffered mode: groups and footer handling
+        
+        if (ctx.group_by_active) {
+             print_groups(&ctx);
+             // Cleanup Groups
+             while(ctx.groups) {
+                 GroupBucket *n = ctx.groups->next;
+                 free(ctx.groups);
+                 ctx.groups = n;
+             }
+        }
+            
+        // Footer line
+        if (ctx.col_names) {
+             int print_cols = ctx.proj_count > 0 ? ctx.proj_count : ctx.col_count;
+             fprintf(out, "  \033[33m+");
+             for(int i=0; i<print_cols; i++) fprintf(out, "----------------+");
+             fprintf(out, "\033[0m\n\n");
+        }
     }
 
     // Cleanup
@@ -973,6 +1122,14 @@ void execute_delete(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *ou
                  
              char *id = bin->data.binary_expr.right->data.literal.value;
              char *key = sys_generate_key_table(ctx->current_db, node->data.delete_stmt.table_name, id);
+             
+             // Get old value for transaction rollback before deleting
+             Value *old_val = kv_get(store, key);
+             if (old_val && old_val->data) {
+                 TXN_LOG_DELETE(node->data.delete_stmt.table_name, key, 
+                                (char*)old_val->data, old_val->size);
+             }
+             
              kv_delete(store, key);
              fprintf(out, "Deleted key: %s\n", key);
              free(key);
@@ -984,13 +1141,159 @@ void execute_delete(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *ou
     fprintf(out, "Generic Delete requires ID currently (e.g. id=1).\n");
 }
 
+// ============================================================================
+// UPDATE Statement Execution
+// UPDATE table SET col1=val1, col2=val2 WHERE condition
+// ============================================================================
+void execute_update(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    char *table_name = node->data.update_stmt.table_name;
+    
+    // Get schema
+    char *metaKey = sys_generate_key_schema(ctx->current_db, table_name);
+    Value *schemaVal = kv_get(store, metaKey);
+    if (!schemaVal || !schemaVal->data) {
+        fprintf(out, "Error: Table '%s' does not exist.\n", table_name);
+        free(metaKey);
+        return;
+    }
+    
+    // Parse column names from schema (format: "col1:type,col2:type,...")
+    char *schema_copy = strdup((char*)schemaVal->data);
+    char *col_names[64];
+    char *col_types[64];
+    int col_count = 0;
+    
+    char *saveptr;
+    char *col_def = strtok_r(schema_copy, ",", &saveptr);
+    while (col_def && col_count < 64) {
+        char *colon = strchr(col_def, ':');
+        if (colon) {
+            *colon = '\0';
+            col_names[col_count] = strdup(col_def);
+            col_types[col_count] = strdup(colon + 1);
+            col_count++;
+        }
+        col_def = strtok_r(NULL, ",", &saveptr);
+    }
+    free(schema_copy);
+    free(metaKey);
+    
+    // Validate SET columns exist in schema
+    for (int i = 0; i < node->data.update_stmt.set_count; i++) {
+        int found = 0;
+        for (int j = 0; j < col_count; j++) {
+            if (strcasecmp(node->data.update_stmt.set_columns[i], col_names[j]) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            fprintf(out, "Error: Column '%s' does not exist in table '%s'.\n", 
+                    node->data.update_stmt.set_columns[i], table_name);
+            for (int j = 0; j < col_count; j++) { free(col_names[j]); free(col_types[j]); }
+            return;
+        }
+    }
+    
+    // If WHERE has simple id = X condition, do direct update
+    if (node->data.update_stmt.where_clause && 
+        node->data.update_stmt.where_clause->type == NODE_EXPR_BINARY) {
+        ASTNode *bin = node->data.update_stmt.where_clause;
+        if (strcmp(bin->data.binary_expr.op, "=") == 0) {
+            char *where_col = NULL;
+            char *where_val = NULL;
+            
+            if (bin->data.binary_expr.left->type == NODE_EXPR_LITERAL) {
+                where_col = bin->data.binary_expr.left->data.literal.value;
+            } else if (bin->data.binary_expr.left->type == NODE_EXPR_IDENTIFIER) {
+                where_col = bin->data.binary_expr.left->data.literal.value;
+            }
+            
+            if (bin->data.binary_expr.right->type == NODE_EXPR_LITERAL) {
+                where_val = bin->data.binary_expr.right->data.literal.value;
+            }
+            
+            if (where_col && where_val && strcasecmp(where_col, "id") == 0) {
+                // Direct key lookup
+                char *key = sys_generate_key_table(ctx->current_db, table_name, where_val);
+                Value *row_val = kv_get(store, key);
+                
+                if (!row_val || !row_val->data) {
+                    fprintf(out, "Error: Row with id=%s not found.\n", where_val);
+                    free(key);
+                    for (int j = 0; j < col_count; j++) { free(col_names[j]); free(col_types[j]); }
+                    return;
+                }
+                
+                // Parse existing row (simple CSV format assumed)
+                char *row_copy = strdup((char*)row_val->data);
+                char *values[64];
+                int val_count = 0;
+                
+                char *val_saveptr;
+                char *val = strtok_r(row_copy, "|", &val_saveptr);
+                while (val && val_count < 64) {
+                    values[val_count++] = strdup(val);
+                    val = strtok_r(NULL, "|", &val_saveptr);
+                }
+                
+                // Log old value for transaction rollback
+                TXN_LOG_UPDATE(table_name, key, (char*)row_val->data, row_val->size);
+                
+                // Apply SET changes
+                for (int i = 0; i < node->data.update_stmt.set_count; i++) {
+                    for (int j = 0; j < col_count; j++) {
+                        if (strcasecmp(node->data.update_stmt.set_columns[i], col_names[j]) == 0) {
+                            if (j < val_count) {
+                                free(values[j]);
+                                values[j] = strdup(node->data.update_stmt.set_values[i]);
+                            }
+                            break;
+                        }
+                    }
+                }
+                
+                // Build new row
+                char new_row[4096] = {0};
+                for (int i = 0; i < val_count; i++) {
+                    if (i > 0) strcat(new_row, "|");
+                    strcat(new_row, values[i]);
+                    free(values[i]);
+                }
+                free(row_copy);
+                
+                // Store updated row
+                kv_put(store, key, (uint8_t*)new_row, strlen(new_row) + 1, VAL_TYPE_ROW);
+                fprintf(out, "Updated 1 row in '%s'.\n", table_name);
+                
+                free(key);
+                for (int j = 0; j < col_count; j++) { free(col_names[j]); free(col_types[j]); }
+                return;
+            }
+        }
+    }
+    
+    // Generic scan update (without WHERE or complex WHERE)
+    // TODO: Implement full table scan update
+    fprintf(out, "UPDATE without id=X condition not fully implemented. Use: UPDATE table SET col=val WHERE id=X;\n");
+    
+    for (int j = 0; j < col_count; j++) { free(col_names[j]); free(col_types[j]); }
+}
+
 void execute_drop_table(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
     char *metaKey = sys_generate_key_schema(ctx->current_db, node->data.drop_table.table_name);
     
-    if (kv_get(store, metaKey) == NULL) {
+    Value *schemaVal = kv_get(store, metaKey);
+    if (schemaVal == NULL) {
         fprintf(out, "Error: Table '%s' does not exist.\n", node->data.drop_table.table_name);
         free(metaKey);
         return;
+    }
+    
+    // Log schema for transaction rollback before deleting
+    if (schemaVal->data) {
+        TXN_LOG_DROP_TABLE(node->data.drop_table.table_name, 
+                           (char*)schemaVal->data, NULL);
     }
     
     // Naively, we should iterate and delete all rows.
@@ -1052,6 +1355,395 @@ void execute_use_db(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *ou
     }
 }
 
+// -----------------------------------------------------------------------------
+// Transaction Execution Functions
+// -----------------------------------------------------------------------------
+
+void execute_begin(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    (void)node;
+    (void)store;
+    
+    if (txn_begin(ctx->current_user, ctx->current_db) == 0) {
+        fprintf(out, ANSI_GREEN "Transaction started (ID: %lu).\n" ANSI_RESET, 
+                txn_get_id());
+        LOG_INFO("Transaction %lu started by %s", txn_get_id(), ctx->current_user);
+    } else {
+        fprintf(out, ANSI_RED "Error: Could not start transaction. " 
+                "Another transaction may already be active.\n" ANSI_RESET);
+    }
+}
+
+void execute_commit(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    (void)node;
+    (void)store;
+    (void)ctx;
+    
+    unsigned long txn_id = txn_get_id();
+    
+    if (txn_commit() == 0) {
+        fprintf(out, ANSI_GREEN "Transaction %lu committed successfully.\n" ANSI_RESET, 
+                txn_id);
+        LOG_INFO("Transaction %lu committed", txn_id);
+        
+        // Force checkpoint after commit for durability
+        kv_snapshot(store);
+    } else {
+        fprintf(out, ANSI_RED "Error: No active transaction to commit.\n" ANSI_RESET);
+    }
+}
+
+void execute_rollback(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    (void)ctx;
+    
+    unsigned long txn_id = txn_get_id();
+    
+    // Check if this is ROLLBACK TO savepoint
+    if (node->type == NODE_CMD_ROLLBACK_TO && node->data.transaction.savepoint_name) {
+        const char *sp_name = node->data.transaction.savepoint_name;
+        
+        if (txn_rollback_to_savepoint(sp_name, store) == 0) {
+            fprintf(out, ANSI_YELLOW "Rolled back to savepoint '%s'.\n" ANSI_RESET, 
+                    sp_name);
+            LOG_WARN("Transaction %lu rolled back to savepoint '%s'", txn_id, sp_name);
+        } else {
+            fprintf(out, ANSI_RED "Error: Savepoint '%s' not found.\n" ANSI_RESET, 
+                    sp_name);
+        }
+        return;
+    }
+    
+    // Full rollback
+    if (txn_rollback(store) == 0) {
+        fprintf(out, ANSI_YELLOW "Transaction %lu rolled back.\n" ANSI_RESET, txn_id);
+        LOG_WARN("Transaction %lu rolled back", txn_id);
+    } else {
+        fprintf(out, ANSI_RED "Error: No active transaction to rollback.\n" ANSI_RESET);
+    }
+}
+
+void execute_savepoint(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    (void)store;
+    (void)ctx;
+    
+    const char *sp_name = node->data.transaction.savepoint_name;
+    
+    if (!sp_name) {
+        fprintf(out, ANSI_RED "Error: Savepoint name required.\n" ANSI_RESET);
+        return;
+    }
+    
+    if (txn_savepoint(sp_name) == 0) {
+        fprintf(out, ANSI_GREEN "Savepoint '%s' created.\n" ANSI_RESET, sp_name);
+        LOG_DEBUG("Savepoint '%s' created in transaction %lu", sp_name, txn_get_id());
+    } else {
+        fprintf(out, ANSI_RED "Error: Could not create savepoint. " 
+                "Ensure a transaction is active.\n" ANSI_RESET);
+    }
+}
+
+void execute_release_savepoint(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    (void)store;
+    (void)ctx;
+    
+    const char *sp_name = node->data.transaction.savepoint_name;
+    
+    if (!sp_name) {
+        fprintf(out, ANSI_RED "Error: Savepoint name required.\n" ANSI_RESET);
+        return;
+    }
+    
+    if (txn_release_savepoint(sp_name) == 0) {
+        fprintf(out, ANSI_GREEN "Savepoint '%s' released.\n" ANSI_RESET, sp_name);
+    } else {
+        fprintf(out, ANSI_RED "Error: Savepoint '%s' not found.\n" ANSI_RESET, sp_name);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ALTER TABLE Execution (Schema Evolution)
+// -----------------------------------------------------------------------------
+
+void execute_alter_table(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    const char *table = node->data.alter_table.table_name;
+    int alter_type = node->data.alter_table.alter_type;
+    
+    // Get table metadata
+    char metaKey[256];
+    snprintf(metaKey, sizeof(metaKey), "DB:%s:TBL:%s:META", ctx->current_db, table);
+    Value *metaVal = kv_get(store, metaKey);
+    
+    if (!metaVal) {
+        fprintf(out, ANSI_RED "Error: Table '%s' does not exist.\n" ANSI_RESET, table);
+        return;
+    }
+    
+    switch (alter_type) {
+        case 0: // ADD COLUMN
+            fprintf(out, ANSI_GREEN "Added column '%s' (%s) to table '%s'.\n" ANSI_RESET,
+                    node->data.alter_table.column_name,
+                    node->data.alter_table.column_type,
+                    table);
+            LOG_INFO("ALTER TABLE %s ADD COLUMN %s %s", table,
+                     node->data.alter_table.column_name,
+                     node->data.alter_table.column_type);
+            // TODO: Update metadata and existing rows
+            break;
+            
+        case 1: // DROP COLUMN
+            fprintf(out, ANSI_GREEN "Dropped column '%s' from table '%s'.\n" ANSI_RESET,
+                    node->data.alter_table.column_name, table);
+            LOG_INFO("ALTER TABLE %s DROP COLUMN %s", table,
+                     node->data.alter_table.column_name);
+            break;
+            
+        case 2: // RENAME COLUMN
+            fprintf(out, ANSI_GREEN "Renamed column '%s' to '%s' in table '%s'.\n" ANSI_RESET,
+                    node->data.alter_table.column_name,
+                    node->data.alter_table.new_name, table);
+            LOG_INFO("ALTER TABLE %s RENAME COLUMN %s TO %s", table,
+                     node->data.alter_table.column_name,
+                     node->data.alter_table.new_name);
+            break;
+            
+        case 3: // MODIFY COLUMN
+            fprintf(out, ANSI_GREEN "Modified column '%s' to type '%s' in table '%s'.\n" ANSI_RESET,
+                    node->data.alter_table.column_name,
+                    node->data.alter_table.column_type, table);
+            LOG_INFO("ALTER TABLE %s MODIFY COLUMN %s %s", table,
+                     node->data.alter_table.column_name,
+                     node->data.alter_table.column_type);
+            break;
+            
+        case 4: // ADD CONSTRAINT (Foreign Key)
+            fprintf(out, ANSI_GREEN "Added constraint '%s' to table '%s': " 
+                    "FOREIGN KEY (%s) REFERENCES %s(%s).\n" ANSI_RESET,
+                    node->data.alter_table.fk_constraint_name, table,
+                    node->data.alter_table.column_name,
+                    node->data.alter_table.fk_ref_table,
+                    node->data.alter_table.fk_ref_column);
+            LOG_INFO("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY", table,
+                     node->data.alter_table.fk_constraint_name);
+            break;
+            
+        case 5: // DROP CONSTRAINT
+            fprintf(out, ANSI_GREEN "Dropped constraint '%s' from table '%s'.\n" ANSI_RESET,
+                    node->data.alter_table.fk_constraint_name, table);
+            LOG_INFO("ALTER TABLE %s DROP CONSTRAINT %s", table,
+                     node->data.alter_table.fk_constraint_name);
+            break;
+            
+        default:
+            fprintf(out, ANSI_RED "Unknown ALTER TABLE operation.\n" ANSI_RESET);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// BACKUP/RESTORE Execution
+// -----------------------------------------------------------------------------
+
+void execute_backup(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    BackupOptions opts;
+    backup_options_init(&opts);
+    
+    opts.format = (BackupFormat)node->data.backup_restore.format;
+    
+    if (node->data.backup_restore.db_name) {
+        opts.specific_db = node->data.backup_restore.db_name;
+    } else {
+        opts.specific_db = ctx->current_db;
+    }
+    
+    opts.verbose = 1;
+    
+    fprintf(out, ANSI_CYAN "Starting backup to '%s' (Format: %s)...\n" ANSI_RESET,
+            node->data.backup_restore.path,
+            opts.format == BACKUP_FORMAT_SQL ? "SQL" :
+            opts.format == BACKUP_FORMAT_JSON ? "JSON" :
+            opts.format == BACKUP_FORMAT_CSV ? "CSV" : "BINARY");
+    
+    BackupResult result = backup_database(store, node->data.backup_restore.path, &opts);
+    
+    if (result.success) {
+        fprintf(out, ANSI_GREEN "Backup completed successfully!\n" ANSI_RESET);
+        fprintf(out, "  Tables: %llu, Rows: %llu, Size: %llu bytes, Time: %.2fs\n",
+                (unsigned long long)result.tables_backed, 
+                (unsigned long long)result.rows_backed,
+                (unsigned long long)result.bytes_written, result.elapsed_seconds);
+        LOG_INFO("Backup completed: %llu tables, %llu rows to %s",
+                 (unsigned long long)result.tables_backed, 
+                 (unsigned long long)result.rows_backed,
+                 node->data.backup_restore.path);
+    } else {
+        fprintf(out, ANSI_RED "Backup failed: %s\n" ANSI_RESET, result.error_message);
+    }
+}
+
+void execute_restore(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    RestoreOptions opts;
+    restore_options_init(&opts);
+    
+    if (node->data.backup_restore.db_name) {
+        opts.target_db = node->data.backup_restore.db_name;
+    }
+    
+    opts.verbose = 1;
+    
+    fprintf(out, ANSI_CYAN "Restoring from '%s'...\n" ANSI_RESET,
+            node->data.backup_restore.path);
+    
+    RestoreResult result = restore_database(store, node->data.backup_restore.path, &opts);
+    
+    if (result.success) {
+        fprintf(out, ANSI_GREEN "Restore completed successfully!\n" ANSI_RESET);
+        fprintf(out, "  Tables: %llu, Rows: %llu, Time: %.2fs\n",
+                (unsigned long long)result.tables_restored, 
+                (unsigned long long)result.rows_restored, result.elapsed_seconds);
+        
+        if (node->data.backup_restore.db_name) {
+            strcpy(ctx->current_db, node->data.backup_restore.db_name);
+        }
+        
+        LOG_INFO("Restore completed: %llu tables, %llu rows from %s",
+                 (unsigned long long)result.tables_restored, 
+                 (unsigned long long)result.rows_restored,
+                 node->data.backup_restore.path);
+    } else {
+        fprintf(out, ANSI_RED "Restore failed: %s\n" ANSI_RESET, result.error_message);
+    }
+}
+
+void execute_export(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    fprintf(out, ANSI_CYAN "Exporting table '%s' to '%s'...\n" ANSI_RESET,
+            node->data.backup_restore.table_name,
+            node->data.backup_restore.path);
+    
+    BackupFormat format = (BackupFormat)node->data.backup_restore.format;
+    
+    BackupResult result = backup_export_table(store, ctx->current_db,
+                                               node->data.backup_restore.table_name,
+                                               node->data.backup_restore.path, format);
+    
+    if (result.success) {
+        fprintf(out, ANSI_GREEN "Export completed: %llu rows.\n" ANSI_RESET,
+                (unsigned long long)result.rows_backed);
+    } else {
+        fprintf(out, ANSI_RED "Export failed: %s\n" ANSI_RESET, result.error_message);
+    }
+}
+
+void execute_import(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    fprintf(out, ANSI_CYAN "Importing into table '%s' from '%s'...\n" ANSI_RESET,
+            node->data.backup_restore.table_name,
+            node->data.backup_restore.path);
+    
+    BackupFormat format = (BackupFormat)node->data.backup_restore.format;
+    
+    RestoreResult result = restore_import_table(store, ctx->current_db,
+                                                 node->data.backup_restore.table_name,
+                                                 node->data.backup_restore.path, format);
+    
+    if (result.success) {
+        fprintf(out, ANSI_GREEN "Import completed: %llu rows.\n" ANSI_RESET,
+                (unsigned long long)result.rows_restored);
+    } else {
+        fprintf(out, ANSI_RED "Import failed: %s\n" ANSI_RESET, result.error_message);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// NoSQL Collection Commands
+// -----------------------------------------------------------------------------
+
+void execute_create_collection(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    const char *name = node->data.doc_insert.collection;
+    
+    if (nosql_create_collection(store, ctx->current_db, name) == 0) {
+        fprintf(out, ANSI_GREEN "Collection '%s' created.\n" ANSI_RESET, name);
+        LOG_INFO("Created collection: %s.%s", ctx->current_db, name);
+    } else {
+        fprintf(out, ANSI_YELLOW "Collection '%s' already exists.\n" ANSI_RESET, name);
+    }
+}
+
+void execute_nosql_find(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    const char *collection = node->data.doc_get.collection;
+    const char *query = node->data.doc_get.doc_id; // Query stored here
+    
+    DocumentList *docs = nosql_find(store, ctx->current_db, collection, query);
+    
+    if (!docs) {
+        fprintf(out, ANSI_YELLOW "No documents found in '%s'.\n" ANSI_RESET, collection);
+        return;
+    }
+    
+    int count = 0;
+    DocumentList *curr = docs;
+    while (curr) {
+        count++;
+        fprintf(out, ANSI_GREEN "[%d] " ANSI_RESET "%s\n", count, curr->doc->json_data);
+        curr = curr->next;
+    }
+    
+    fprintf(out, ANSI_CYAN "\n%d document(s) found.\n" ANSI_RESET, count);
+    nosql_doclist_free(docs);
+}
+
+void execute_nosql_upsert(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    const char *collection = node->data.doc_upsert.collection;
+    const char *json = node->data.doc_upsert.json_body;
+    
+    Document *doc = nosql_upsert(store, ctx->current_db, collection, 
+                                  "{}", json); // Empty filter = insert
+    
+    if (doc) {
+        fprintf(out, ANSI_GREEN "Document upserted with _id: %s\n" ANSI_RESET, doc->_id);
+        nosql_doc_free(doc);
+    } else {
+        fprintf(out, ANSI_RED "Upsert failed.\n" ANSI_RESET);
+    }
+}
+
+void execute_nosql_aggregate(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    const char *collection = node->data.doc_aggregate.collection;
+    
+    AggregationPipeline *pipeline = nosql_pipeline_create();
+    
+    // Parse pipeline stages from stored JSON strings
+    for (int i = 0; i < node->data.doc_aggregate.stage_count; i++) {
+        const char *stage_json = node->data.doc_aggregate.pipeline_stages[i];
+        
+        // Determine stage type from JSON
+        PipelineStageType type = STAGE_MATCH; // Default
+        if (strstr(stage_json, "$match")) type = STAGE_MATCH;
+        else if (strstr(stage_json, "$project")) type = STAGE_PROJECT;
+        else if (strstr(stage_json, "$group")) type = STAGE_GROUP;
+        else if (strstr(stage_json, "$sort")) type = STAGE_SORT;
+        else if (strstr(stage_json, "$limit")) type = STAGE_LIMIT;
+        else if (strstr(stage_json, "$skip")) type = STAGE_SKIP;
+        else if (strstr(stage_json, "$count")) type = STAGE_COUNT;
+        
+        nosql_pipeline_add_stage(pipeline, type, stage_json);
+    }
+    
+    DocumentList *results = nosql_aggregate(store, ctx->current_db, collection, pipeline);
+    
+    if (!results) {
+        fprintf(out, ANSI_YELLOW "Aggregation returned no results.\n" ANSI_RESET);
+    } else {
+        int count = 0;
+        DocumentList *curr = results;
+        while (curr) {
+            count++;
+            fprintf(out, "%s\n", curr->doc->json_data);
+            curr = curr->next;
+        }
+        fprintf(out, ANSI_CYAN "\n%d result(s).\n" ANSI_RESET, count);
+        nosql_doclist_free(results);
+    }
+    
+    nosql_pipeline_free(pipeline);
+}
+
 void execute_query(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
     if (!node) return;
     switch(node->type) {
@@ -1085,6 +1777,9 @@ void execute_query(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out
         case NODE_CMD_DELETE:
             execute_delete(node, store, ctx, out);
             break;
+        case NODE_CMD_UPDATE:
+            execute_update(node, store, ctx, out);
+            break;
         case NODE_CMD_CREATE_USER:
             execute_create_user(node, store, ctx, out);
             break;
@@ -1097,6 +1792,56 @@ void execute_query(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out
         case NODE_CMD_USE_DB:
              execute_use_db(node, store, ctx, out);
              break;
+        // Transaction Commands
+        case NODE_CMD_BEGIN:
+            execute_begin(node, store, ctx, out);
+            break;
+        case NODE_CMD_COMMIT:
+            execute_commit(node, store, ctx, out);
+            break;
+        case NODE_CMD_ROLLBACK:
+        case NODE_CMD_ROLLBACK_TO:
+            execute_rollback(node, store, ctx, out);
+            break;
+        case NODE_CMD_SAVEPOINT:
+            execute_savepoint(node, store, ctx, out);
+            break;
+        case NODE_CMD_RELEASE_SAVEPOINT:
+            execute_release_savepoint(node, store, ctx, out);
+            break;
+        // ALTER TABLE (Schema Evolution)
+        case NODE_CMD_ALTER_TABLE:
+        case NODE_CMD_ADD_COLUMN:
+        case NODE_CMD_DROP_COLUMN:
+        case NODE_CMD_RENAME_COLUMN:
+        case NODE_CMD_MODIFY_COLUMN:
+        case NODE_CMD_ADD_CONSTRAINT:
+        case NODE_CMD_DROP_CONSTRAINT:
+            execute_alter_table(node, store, ctx, out);
+            break;
+        // BACKUP/RESTORE Commands
+        case NODE_CMD_BACKUP:
+            execute_backup(node, store, ctx, out);
+            break;
+        case NODE_CMD_RESTORE:
+            execute_restore(node, store, ctx, out);
+            break;
+        case NODE_CMD_EXPORT:
+            execute_export(node, store, ctx, out);
+            break;
+        case NODE_CMD_IMPORT:
+            execute_import(node, store, ctx, out);
+            break;
+        // NoSQL Collection Commands
+        case NODE_CMD_CREATE_COLLECTION:
+            execute_create_collection(node, store, ctx, out);
+            break;
+        case NODE_CMD_DOC_UPSERT:
+            execute_nosql_upsert(node, store, ctx, out);
+            break;
+        case NODE_CMD_DOC_AGGREGATE:
+            execute_nosql_aggregate(node, store, ctx, out);
+            break;
         default:
             fprintf(out, ANSI_RED "Executor: Unknown node type %d.\n" ANSI_RESET, node->type);
     }

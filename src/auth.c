@@ -4,7 +4,7 @@
 #include "auth.h"
 #include "storage.h"
 
-// Simple hash (djb2) for password storage (In production use bcrypt/argon2)
+// Simple hash (djb2) for password storage
 static unsigned long hash_password(const char *str) {
     unsigned long hash = 5381;
     int c;

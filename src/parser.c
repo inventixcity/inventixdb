@@ -202,17 +202,13 @@ ASTNode* parse_create_table(ParserContext *ctx) {
 
 // 2. Insert: INSERT [karo] [INTO] table VALUES (...)
 ASTNode* parse_insert(ParserContext *ctx) {
-    consume(ctx, TOKEN_KW_INSERT, "Expected 'INSERT' or 'DAALO'");
+    consume(ctx, TOKEN_KW_INSERT, "Expected 'INSERT' or 'DAALO' or 'DALO'");
     
-    // Optional 'INTO' (Not tokenized explicitly, treated as identifier if we aren't careful)
-    // Actually, SQL standard is INSERT INTO.
-    // Lexer doesn't have INTO. It will be IDENTIFIER "INTO".
-    // Hinglish "INSERT KARO".
-    
+    // Optional 'KARO' (Hinglish) or 'INTO' (SQL standard) or 'MEIN' (Hinglish INTO)
     if (current_token(ctx)->type == TOKEN_KW_KARO) {
         consume(ctx, TOKEN_KW_KARO, "Expected 'karo'");
-    } else if (current_token(ctx)->type == TOKEN_IDENTIFIER && strcasecmp(current_token(ctx)->value, "INTO") == 0) {
-        consume(ctx, TOKEN_IDENTIFIER, "INTO");
+    } else if (current_token(ctx)->type == TOKEN_KW_INTO) {
+        consume(ctx, TOKEN_KW_INTO, "INTO");
     }
 
     ASTNode *node = create_node(NODE_CMD_INSERT);
@@ -243,6 +239,10 @@ ASTNode* parse_insert(ParserContext *ctx) {
             else if (current_token(ctx)->type == TOKEN_KW_AUTO) {
                  val = consume(ctx, TOKEN_KW_AUTO, "Auto");
                  isAuto = 1;
+            }
+            else if (current_token(ctx)->type == TOKEN_IDENTIFIER) {
+                 // Allow unquoted strings (identifiers) as values
+                 val = consume(ctx, TOKEN_IDENTIFIER, "Value");
             }
             else {
                  printf("Error: Expected literal value or AUTO\n"); 
@@ -356,6 +356,59 @@ ASTNode* parse_select(ParserContext *ctx, int is_subquery) {
         g->value = strdup(gcol->value);
         g->next = NULL;
         node->data.select.group_by = g;
+    }
+
+    // Optional ORDER BY (KRAM DWARA)
+    node->data.select.order_columns = NULL;
+    node->data.select.order_desc = NULL;
+    node->data.select.order_by_count = 0;
+    
+    if (match(ctx, TOKEN_KW_ORDER)) {
+        consume(ctx, TOKEN_KW_BY, "Expected 'BY/DWARA' after ORDER");
+        
+        int cap = 4;
+        node->data.select.order_columns = malloc(cap * sizeof(char*));
+        node->data.select.order_desc = malloc(cap * sizeof(int));
+        
+        int count = 0;
+        do {
+            Token *ocol = consume(ctx, TOKEN_IDENTIFIER, "Expected ORDER BY column");
+            
+            // Expand if needed
+            if (count >= cap) {
+                cap *= 2;
+                node->data.select.order_columns = realloc(node->data.select.order_columns, cap * sizeof(char*));
+                node->data.select.order_desc = realloc(node->data.select.order_desc, cap * sizeof(int));
+            }
+            
+            node->data.select.order_columns[count] = strdup(ocol->value);
+            
+            // Check for ASC/DESC
+            if (match(ctx, TOKEN_KW_DESC)) {
+                node->data.select.order_desc[count] = 1;
+            } else {
+                if (match(ctx, TOKEN_KW_ASC)) { /* Consume it */ }
+                node->data.select.order_desc[count] = 0;
+            }
+            count++;
+        } while (match(ctx, TOKEN_COMMA));
+        
+        node->data.select.order_by_count = count;
+    }
+
+    // Optional LIMIT (SEEMA)
+    node->data.select.limit = -1;
+    node->data.select.offset = 0;
+    
+    if (match(ctx, TOKEN_KW_LIMIT)) {
+        Token *lim = consume(ctx, TOKEN_INT_LITERAL, "Expected LIMIT value");
+        node->data.select.limit = atoi(lim->value);
+        
+        // Optional OFFSET
+        if (match(ctx, TOKEN_KW_OFFSET)) {
+            Token *off = consume(ctx, TOKEN_INT_LITERAL, "Expected OFFSET value");
+            node->data.select.offset = atoi(off->value);
+        }
     }
 
     if (!is_subquery) {
@@ -537,10 +590,80 @@ ASTNode* parse_delete(ParserContext *ctx) {
     return node;
 }
 
-// 7. Drop Table: TABLE GIRAO name
+// UPDATE table SET col=val, col2=val2 WHERE ...
+// Hinglish: BADLO table RAKHO_YEH col=val JAHAN ...
+ASTNode* parse_update(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_UPDATE, "UPDATE/BADLO");
+    
+    ASTNode *node = create_node(NODE_CMD_UPDATE);
+    Token *tbl = consume(ctx, TOKEN_IDENTIFIER, "Table name");
+    node->data.update_stmt.table_name = strdup(tbl->value);
+    
+    consume(ctx, TOKEN_KW_SET, "SET/RAKHO_YEH");
+    
+    // Parse SET assignments: col1=val1, col2=val2, ...
+    int capacity = 8;
+    node->data.update_stmt.set_columns = malloc(capacity * sizeof(char*));
+    node->data.update_stmt.set_values = malloc(capacity * sizeof(char*));
+    node->data.update_stmt.set_count = 0;
+    
+    do {
+        if (node->data.update_stmt.set_count >= capacity) {
+            capacity *= 2;
+            node->data.update_stmt.set_columns = realloc(node->data.update_stmt.set_columns, capacity * sizeof(char*));
+            node->data.update_stmt.set_values = realloc(node->data.update_stmt.set_values, capacity * sizeof(char*));
+        }
+        
+        Token *col = consume(ctx, TOKEN_IDENTIFIER, "Column name");
+        consume(ctx, TOKEN_EQUALS, "=");
+        
+        Token *val = current_token(ctx);
+        char *value_str = NULL;
+        
+        if (val->type == TOKEN_STRING) {
+            value_str = strdup(val->value);
+            advance(ctx);
+        } else if (val->type == TOKEN_INT_LITERAL) {
+            value_str = strdup(val->value);
+            advance(ctx);
+        } else if (val->type == TOKEN_FLOAT_LITERAL) {
+            value_str = strdup(val->value);
+            advance(ctx);
+        } else if (val->type == TOKEN_IDENTIFIER) {
+            // Could be NULL or another column reference
+            value_str = strdup(val->value);
+            advance(ctx);
+        } else {
+            fprintf(stderr, "Parse Error: Expected value in SET clause\n");
+            return NULL;
+        }
+        
+        int idx = node->data.update_stmt.set_count++;
+        node->data.update_stmt.set_columns[idx] = strdup(col->value);
+        node->data.update_stmt.set_values[idx] = value_str;
+        
+    } while (match(ctx, TOKEN_COMMA));
+    
+    // Optional WHERE clause
+    node->data.update_stmt.where_clause = NULL;
+    if (match(ctx, TOKEN_KW_JAHAN) || match(ctx, TOKEN_KW_WHERE)) {
+        node->data.update_stmt.where_clause = parse_expression(ctx);
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+// 7. Drop Table: TABLE GIRAO name  OR  GIRAO TABLE name  OR  DROP TABLE name
 ASTNode* parse_drop_table(ParserContext *ctx) {
-    consume(ctx, TOKEN_KW_TABLE, "TABLE");
-    consume(ctx, TOKEN_KW_GIRAO, "GIRAO");
+    // Support both "TABLE GIRAO name" and "GIRAO TABLE name"
+    if (current_token(ctx)->type == TOKEN_KW_TABLE) {
+        consume(ctx, TOKEN_KW_TABLE, "TABLE");
+        consume(ctx, TOKEN_KW_GIRAO, "GIRAO/DROP");
+    } else {
+        consume(ctx, TOKEN_KW_GIRAO, "GIRAO/DROP");
+        consume(ctx, TOKEN_KW_TABLE, "TABLE");
+    }
     ASTNode *node = create_node(NODE_CMD_DROP_TABLE);
     Token *name = consume(ctx, TOKEN_IDENTIFIER, "Table Name");
     node->data.drop_table.table_name = strdup(name->value);
@@ -605,6 +728,109 @@ ASTNode* parse_checkpoint(ParserContext *ctx) {
     return node;
 }
 
+// -----------------------------------------------------------------------------
+// Transaction Command Parsing
+// -----------------------------------------------------------------------------
+
+ASTNode* parse_begin(ParserContext *ctx) {
+    // BEGIN [TRANSACTION] or START TRANSACTION
+    if (current_token(ctx)->type == TOKEN_KW_BEGIN) {
+        consume(ctx, TOKEN_KW_BEGIN, "BEGIN");
+    } else if (current_token(ctx)->type == TOKEN_KW_START) {
+        consume(ctx, TOKEN_KW_START, "START");
+        consume(ctx, TOKEN_KW_TRANSACTION, "TRANSACTION");
+    }
+    
+    // Optional TRANSACTION keyword after BEGIN
+    if (current_token(ctx)->type == TOKEN_KW_TRANSACTION) {
+        advance(ctx);
+    }
+    
+    ASTNode *node = create_node(NODE_CMD_BEGIN);
+    node->data.transaction.savepoint_name = NULL;
+    
+    if (current_token(ctx)->type == TOKEN_SEMICOLON) advance(ctx);
+    return node;
+}
+
+ASTNode* parse_commit(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_COMMIT, "COMMIT");
+    
+    // Optional TRANSACTION keyword
+    if (current_token(ctx)->type == TOKEN_KW_TRANSACTION) {
+        advance(ctx);
+    }
+    
+    ASTNode *node = create_node(NODE_CMD_COMMIT);
+    node->data.transaction.savepoint_name = NULL;
+    
+    if (current_token(ctx)->type == TOKEN_SEMICOLON) advance(ctx);
+    return node;
+}
+
+ASTNode* parse_rollback(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_ROLLBACK, "ROLLBACK");
+    
+    // Check for ROLLBACK TO SAVEPOINT <name> or ROLLBACK TO <name>
+    if (current_token(ctx)->type == TOKEN_KW_TO) {
+        advance(ctx);  // consume TO
+        
+        // Optional SAVEPOINT keyword
+        if (current_token(ctx)->type == TOKEN_KW_SAVEPOINT) {
+            advance(ctx);
+        }
+        
+        // Get savepoint name
+        Token *name = consume(ctx, TOKEN_IDENTIFIER, "savepoint name");
+        
+        ASTNode *node = create_node(NODE_CMD_ROLLBACK_TO);
+        node->data.transaction.savepoint_name = strdup(name->value);
+        
+        if (current_token(ctx)->type == TOKEN_SEMICOLON) advance(ctx);
+        return node;
+    }
+    
+    // Optional TRANSACTION keyword
+    if (current_token(ctx)->type == TOKEN_KW_TRANSACTION) {
+        advance(ctx);
+    }
+    
+    ASTNode *node = create_node(NODE_CMD_ROLLBACK);
+    node->data.transaction.savepoint_name = NULL;
+    
+    if (current_token(ctx)->type == TOKEN_SEMICOLON) advance(ctx);
+    return node;
+}
+
+ASTNode* parse_savepoint(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_SAVEPOINT, "SAVEPOINT");
+    
+    Token *name = consume(ctx, TOKEN_IDENTIFIER, "savepoint name");
+    
+    ASTNode *node = create_node(NODE_CMD_SAVEPOINT);
+    node->data.transaction.savepoint_name = strdup(name->value);
+    
+    if (current_token(ctx)->type == TOKEN_SEMICOLON) advance(ctx);
+    return node;
+}
+
+ASTNode* parse_release_savepoint(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_RELEASE, "RELEASE");
+    
+    // Optional SAVEPOINT keyword
+    if (current_token(ctx)->type == TOKEN_KW_SAVEPOINT) {
+        advance(ctx);
+    }
+    
+    Token *name = consume(ctx, TOKEN_IDENTIFIER, "savepoint name");
+    
+    ASTNode *node = create_node(NODE_CMD_RELEASE_SAVEPOINT);
+    node->data.transaction.savepoint_name = strdup(name->value);
+    
+    if (current_token(ctx)->type == TOKEN_SEMICOLON) advance(ctx);
+    return node;
+}
+
 ASTNode* parse_use_db(ParserContext *ctx) {
     consume(ctx, TOKEN_KW_USE, "USE");
     ASTNode *node = malloc(sizeof(ASTNode)); // Explicit malloc to be safe
@@ -616,6 +842,459 @@ ASTNode* parse_use_db(ParserContext *ctx) {
     node->data.use_db.db_name = strdup(current_token(ctx)->value);
     consume(ctx, TOKEN_IDENTIFIER, "database name");
     if (current_token(ctx)->type == TOKEN_SEMICOLON) advance(ctx);
+    return node;
+}
+
+// -----------------------------------------------------------------------------
+// ALTER TABLE Parsing (Hinglish: BADLO_TABLE)
+// ALTER TABLE name ADD COLUMN col_name TYPE [constraints]
+// ALTER TABLE name DROP COLUMN col_name
+// ALTER TABLE name RENAME COLUMN old_name TO new_name
+// ALTER TABLE name MODIFY COLUMN col_name TYPE [constraints]
+// ALTER TABLE name ADD CONSTRAINT name FOREIGN KEY (col) REFERENCES table(col)
+// ALTER TABLE name DROP CONSTRAINT name
+// -----------------------------------------------------------------------------
+
+ASTNode* parse_alter_table(ParserContext *ctx) {
+    // Consume ALTER/BADLO_TABLE
+    if (current_token(ctx)->type == TOKEN_KW_ALTER) {
+        consume(ctx, TOKEN_KW_ALTER, "ALTER");
+        consume(ctx, TOKEN_KW_TABLE, "TABLE");
+    }
+    // TOKEN_KW_ALTER handles both English and Hinglish via lexer
+    
+    Token *tbl = consume(ctx, TOKEN_IDENTIFIER, "Table name");
+    
+    ASTNode *node = NULL;
+    
+    // Determine ALTER type
+    if (current_token(ctx)->type == TOKEN_KW_ADD) {
+        consume(ctx, TOKEN_KW_ADD, "ADD/JODO_COLUMN");
+        
+        // ADD COLUMN or ADD CONSTRAINT?
+        if (current_token(ctx)->type == TOKEN_KW_COLUMN || 
+            current_token(ctx)->type == TOKEN_IDENTIFIER) {
+            // ADD COLUMN col_name TYPE
+            if (current_token(ctx)->type == TOKEN_KW_COLUMN) advance(ctx);
+            
+            node = create_node(NODE_CMD_ADD_COLUMN);
+            node->data.alter_table.table_name = strdup(tbl->value);
+            node->data.alter_table.alter_type = 0; // ADD_COLUMN
+            
+            Token *col = consume(ctx, TOKEN_IDENTIFIER, "Column name");
+            node->data.alter_table.column_name = strdup(col->value);
+            
+            // Type
+            Token *colType = NULL;
+            if (current_token(ctx)->type == TOKEN_KW_INT) colType = consume(ctx, TOKEN_KW_INT, "INT");
+            else if (current_token(ctx)->type == TOKEN_KW_FLOAT) colType = consume(ctx, TOKEN_KW_FLOAT, "FLOAT");
+            else if (current_token(ctx)->type == TOKEN_KW_STRING_TYPE) colType = consume(ctx, TOKEN_KW_STRING_TYPE, "STRING");
+            else if (current_token(ctx)->type == TOKEN_KW_TEXT_TYPE) colType = consume(ctx, TOKEN_KW_TEXT_TYPE, "TEXT");
+            else if (current_token(ctx)->type == TOKEN_KW_BOOL_TYPE) colType = consume(ctx, TOKEN_KW_BOOL_TYPE, "BOOL");
+            else {
+                printf("Error: Expected column type\n");
+                longjmp(ctx->env, 1);
+            }
+            node->data.alter_table.column_type = strdup(colType->value);
+            
+            // Optional constraints: NOT NULL, DEFAULT, UNIQUE
+            node->data.alter_table.is_nullable = 1; // Default nullable
+            node->data.alter_table.is_unique = 0;
+            node->data.alter_table.default_value = NULL;
+            
+            while (current_token(ctx)->type != TOKEN_SEMICOLON) {
+                if (current_token(ctx)->type == TOKEN_KW_NOT) {
+                    consume(ctx, TOKEN_KW_NOT, "NOT");
+                    consume(ctx, TOKEN_KW_NULL, "NULL");
+                    node->data.alter_table.is_nullable = 0;
+                } else if (current_token(ctx)->type == TOKEN_KW_DEFAULT) {
+                    consume(ctx, TOKEN_KW_DEFAULT, "DEFAULT");
+                    Token *def = current_token(ctx);
+                    if (def->type == TOKEN_STRING || def->type == TOKEN_INT_LITERAL || 
+                        def->type == TOKEN_FLOAT_LITERAL) {
+                        node->data.alter_table.default_value = strdup(def->value);
+                        advance(ctx);
+                    }
+                } else if (current_token(ctx)->type == TOKEN_KW_UNIQUE) {
+                    consume(ctx, TOKEN_KW_UNIQUE, "UNIQUE");
+                    node->data.alter_table.is_unique = 1;
+                } else {
+                    break;
+                }
+            }
+            
+        } else if (current_token(ctx)->type == TOKEN_KW_CONSTRAINT) {
+            // ADD CONSTRAINT name FOREIGN KEY (col) REFERENCES table(col)
+            consume(ctx, TOKEN_KW_CONSTRAINT, "CONSTRAINT");
+            
+            node = create_node(NODE_CMD_ADD_CONSTRAINT);
+            node->data.alter_table.table_name = strdup(tbl->value);
+            node->data.alter_table.alter_type = 4; // ADD_CONSTRAINT
+            
+            Token *constraintName = consume(ctx, TOKEN_IDENTIFIER, "Constraint name");
+            node->data.alter_table.fk_constraint_name = strdup(constraintName->value);
+            
+            consume(ctx, TOKEN_KW_FOREIGN, "FOREIGN");
+            consume(ctx, TOKEN_KW_KEY, "KEY");
+            consume(ctx, TOKEN_LPAREN, "(");
+            Token *fkCol = consume(ctx, TOKEN_IDENTIFIER, "Foreign key column");
+            node->data.alter_table.column_name = strdup(fkCol->value);
+            consume(ctx, TOKEN_RPAREN, ")");
+            
+            consume(ctx, TOKEN_KW_REFERENCES, "REFERENCES");
+            Token *refTable = consume(ctx, TOKEN_IDENTIFIER, "Referenced table");
+            node->data.alter_table.fk_ref_table = strdup(refTable->value);
+            consume(ctx, TOKEN_LPAREN, "(");
+            Token *refCol = consume(ctx, TOKEN_IDENTIFIER, "Referenced column");
+            node->data.alter_table.fk_ref_column = strdup(refCol->value);
+            consume(ctx, TOKEN_RPAREN, ")");
+            
+            // Optional ON DELETE/UPDATE CASCADE/RESTRICT
+            node->data.alter_table.fk_on_delete = 0;
+            node->data.alter_table.fk_on_update = 0;
+            
+            while (current_token(ctx)->type != TOKEN_SEMICOLON) {
+                if (current_token(ctx)->type == TOKEN_KW_ON) {
+                    advance(ctx);
+                    if (current_token(ctx)->type == TOKEN_KW_DELETE) {
+                        advance(ctx);
+                        if (current_token(ctx)->type == TOKEN_KW_CASCADE) {
+                            node->data.alter_table.fk_on_delete = 1;
+                            advance(ctx);
+                        } else if (current_token(ctx)->type == TOKEN_KW_RESTRICT) {
+                            node->data.alter_table.fk_on_delete = 2;
+                            advance(ctx);
+                        }
+                    } else if (current_token(ctx)->type == TOKEN_KW_UPDATE) {
+                        advance(ctx);
+                        if (current_token(ctx)->type == TOKEN_KW_CASCADE) {
+                            node->data.alter_table.fk_on_update = 1;
+                            advance(ctx);
+                        } else if (current_token(ctx)->type == TOKEN_KW_RESTRICT) {
+                            node->data.alter_table.fk_on_update = 2;
+                            advance(ctx);
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        
+    } else if (current_token(ctx)->type == TOKEN_KW_DROP) {
+        consume(ctx, TOKEN_KW_DROP, "DROP/GIRAO");
+        
+        if (current_token(ctx)->type == TOKEN_KW_COLUMN) {
+            consume(ctx, TOKEN_KW_COLUMN, "COLUMN");
+            node = create_node(NODE_CMD_DROP_COLUMN);
+            node->data.alter_table.table_name = strdup(tbl->value);
+            node->data.alter_table.alter_type = 1; // DROP_COLUMN
+            Token *col = consume(ctx, TOKEN_IDENTIFIER, "Column name");
+            node->data.alter_table.column_name = strdup(col->value);
+        } else if (current_token(ctx)->type == TOKEN_KW_CONSTRAINT) {
+            consume(ctx, TOKEN_KW_CONSTRAINT, "CONSTRAINT");
+            node = create_node(NODE_CMD_DROP_CONSTRAINT);
+            node->data.alter_table.table_name = strdup(tbl->value);
+            node->data.alter_table.alter_type = 5; // DROP_CONSTRAINT
+            Token *name = consume(ctx, TOKEN_IDENTIFIER, "Constraint name");
+            node->data.alter_table.fk_constraint_name = strdup(name->value);
+        }
+        
+    } else if (current_token(ctx)->type == TOKEN_KW_RENAME) {
+        consume(ctx, TOKEN_KW_RENAME, "RENAME/NAAM_BADLO");
+        consume(ctx, TOKEN_KW_COLUMN, "COLUMN");
+        
+        node = create_node(NODE_CMD_RENAME_COLUMN);
+        node->data.alter_table.table_name = strdup(tbl->value);
+        node->data.alter_table.alter_type = 2; // RENAME_COLUMN
+        
+        Token *oldName = consume(ctx, TOKEN_IDENTIFIER, "Old column name");
+        node->data.alter_table.column_name = strdup(oldName->value);
+        
+        consume(ctx, TOKEN_KW_TO, "TO");
+        Token *newName = consume(ctx, TOKEN_IDENTIFIER, "New column name");
+        node->data.alter_table.new_name = strdup(newName->value);
+        
+    } else if (current_token(ctx)->type == TOKEN_KW_MODIFY) {
+        consume(ctx, TOKEN_KW_MODIFY, "MODIFY/SUDHAR");
+        if (current_token(ctx)->type == TOKEN_KW_COLUMN) advance(ctx);
+        
+        node = create_node(NODE_CMD_MODIFY_COLUMN);
+        node->data.alter_table.table_name = strdup(tbl->value);
+        node->data.alter_table.alter_type = 3; // MODIFY_COLUMN
+        
+        Token *col = consume(ctx, TOKEN_IDENTIFIER, "Column name");
+        node->data.alter_table.column_name = strdup(col->value);
+        
+        // New type
+        Token *colType = NULL;
+        if (current_token(ctx)->type == TOKEN_KW_INT) colType = consume(ctx, TOKEN_KW_INT, "INT");
+        else if (current_token(ctx)->type == TOKEN_KW_FLOAT) colType = consume(ctx, TOKEN_KW_FLOAT, "FLOAT");
+        else if (current_token(ctx)->type == TOKEN_KW_STRING_TYPE) colType = consume(ctx, TOKEN_KW_STRING_TYPE, "STRING");
+        else if (current_token(ctx)->type == TOKEN_KW_TEXT_TYPE) colType = consume(ctx, TOKEN_KW_TEXT_TYPE, "TEXT");
+        else if (current_token(ctx)->type == TOKEN_KW_BOOL_TYPE) colType = consume(ctx, TOKEN_KW_BOOL_TYPE, "BOOL");
+        else {
+            printf("Error: Expected column type\n");
+            longjmp(ctx->env, 1);
+        }
+        node->data.alter_table.column_type = strdup(colType->value);
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+// -----------------------------------------------------------------------------
+// BACKUP/RESTORE Parsing (Hinglish: SURAKSHA/WAPAS_LAO)
+// BACKUP DATABASE [db] TO 'path' [FORMAT SQL|JSON|CSV|BINARY]
+// RESTORE DATABASE [db] FROM 'path'
+// EXPORT TABLE table TO 'path' [FORMAT CSV|JSON]
+// IMPORT TABLE table FROM 'path'
+// -----------------------------------------------------------------------------
+
+ASTNode* parse_backup(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_BACKUP, "BACKUP/SURAKSHA");
+    
+    ASTNode *node = create_node(NODE_CMD_BACKUP);
+    node->data.backup_restore.db_name = NULL;
+    node->data.backup_restore.table_name = NULL;
+    node->data.backup_restore.format = 0; // Default BINARY
+    node->data.backup_restore.compression = 0;
+    
+    // Optional DATABASE keyword
+    if (current_token(ctx)->type == TOKEN_KW_DATABASE) {
+        advance(ctx);
+        if (current_token(ctx)->type == TOKEN_IDENTIFIER) {
+            Token *db = consume(ctx, TOKEN_IDENTIFIER, "Database name");
+            node->data.backup_restore.db_name = strdup(db->value);
+        }
+    }
+    
+    // TO 'path'
+    consume(ctx, TOKEN_KW_TO, "TO");
+    Token *path = consume(ctx, TOKEN_STRING, "Backup path");
+    node->data.backup_restore.path = strdup(path->value);
+    
+    // Optional FORMAT
+    if (current_token(ctx)->type == TOKEN_KW_FORMAT) {
+        advance(ctx);
+        Token *fmt = consume(ctx, TOKEN_IDENTIFIER, "Format (SQL|JSON|CSV|BINARY)");
+        if (strcasecmp(fmt->value, "SQL") == 0) node->data.backup_restore.format = 1;
+        else if (strcasecmp(fmt->value, "JSON") == 0) node->data.backup_restore.format = 2;
+        else if (strcasecmp(fmt->value, "CSV") == 0) node->data.backup_restore.format = 3;
+        else node->data.backup_restore.format = 0; // BINARY
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_restore(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_RESTORE, "RESTORE/WAPAS_LAO");
+    
+    ASTNode *node = create_node(NODE_CMD_RESTORE);
+    node->data.backup_restore.db_name = NULL;
+    node->data.backup_restore.table_name = NULL;
+    
+    // Optional DATABASE keyword
+    if (current_token(ctx)->type == TOKEN_KW_DATABASE) {
+        advance(ctx);
+        if (current_token(ctx)->type == TOKEN_IDENTIFIER) {
+            Token *db = consume(ctx, TOKEN_IDENTIFIER, "Database name");
+            node->data.backup_restore.db_name = strdup(db->value);
+        }
+    }
+    
+    // FROM 'path'
+    consume(ctx, TOKEN_KW_FROM, "FROM");
+    Token *path = consume(ctx, TOKEN_STRING, "Backup path");
+    node->data.backup_restore.path = strdup(path->value);
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_export(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_EXPORT, "EXPORT/BHEJO");
+    consume(ctx, TOKEN_KW_TABLE, "TABLE");
+    
+    ASTNode *node = create_node(NODE_CMD_EXPORT);
+    
+    Token *tbl = consume(ctx, TOKEN_IDENTIFIER, "Table name");
+    node->data.backup_restore.table_name = strdup(tbl->value);
+    node->data.backup_restore.db_name = NULL;
+    node->data.backup_restore.format = 3; // Default CSV
+    
+    consume(ctx, TOKEN_KW_TO, "TO");
+    Token *path = consume(ctx, TOKEN_STRING, "Export path");
+    node->data.backup_restore.path = strdup(path->value);
+    
+    // Optional FORMAT
+    if (current_token(ctx)->type == TOKEN_KW_FORMAT) {
+        advance(ctx);
+        Token *fmt = consume(ctx, TOKEN_IDENTIFIER, "Format (CSV|JSON)");
+        if (strcasecmp(fmt->value, "JSON") == 0) node->data.backup_restore.format = 2;
+        else node->data.backup_restore.format = 3; // CSV
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_import(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_IMPORT, "IMPORT/LAAO");
+    consume(ctx, TOKEN_KW_TABLE, "TABLE");
+    
+    ASTNode *node = create_node(NODE_CMD_IMPORT);
+    
+    Token *tbl = consume(ctx, TOKEN_IDENTIFIER, "Table name");
+    node->data.backup_restore.table_name = strdup(tbl->value);
+    node->data.backup_restore.db_name = NULL;
+    
+    consume(ctx, TOKEN_KW_FROM, "FROM");
+    Token *path = consume(ctx, TOKEN_STRING, "Import path");
+    node->data.backup_restore.path = strdup(path->value);
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+// -----------------------------------------------------------------------------
+// NoSQL Collection Commands (MongoDB-style with Hinglish)
+// CREATE COLLECTION name (SANGRAH BANAO name)
+// FIND collection { query } (KHOJO collection)
+// UPSERT collection { doc } (DAL_YA_BADLO collection)
+// AGGREGATE collection [ stages ] (IKATHA collection)
+// -----------------------------------------------------------------------------
+
+ASTNode* parse_create_collection(ParserContext *ctx) {
+    // Already consumed CREATE, now consume COLLECTION
+    consume(ctx, TOKEN_KW_COLLECTION, "COLLECTION/SANGRAH");
+    
+    ASTNode *node = create_node(NODE_CMD_CREATE_COLLECTION);
+    Token *name = consume(ctx, TOKEN_IDENTIFIER, "Collection name");
+    node->data.doc_insert.collection = strdup(name->value);
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_find(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_FIND, "FIND/KHOJO");
+    
+    ASTNode *node = create_node(NODE_CMD_DOC_GET);
+    Token *col = consume(ctx, TOKEN_IDENTIFIER, "Collection name");
+    node->data.doc_get.collection = strdup(col->value);
+    node->data.doc_get.doc_id = NULL;
+    
+    // Optional query filter
+    if (current_token(ctx)->type == TOKEN_LBRACE) {
+        char buffer[1024] = "{";
+        consume(ctx, TOKEN_LBRACE, "{");
+        int depth = 1;
+        while (depth > 0 && current_token(ctx)->type != TOKEN_EOF) {
+            if (current_token(ctx)->type == TOKEN_LBRACE) depth++;
+            if (current_token(ctx)->type == TOKEN_RBRACE) depth--;
+            if (depth > 0) {
+                strcat(buffer, current_token(ctx)->value);
+                strcat(buffer, " ");
+            }
+            advance(ctx);
+        }
+        strcat(buffer, "}");
+        // Store query in doc_id temporarily (or add query field)
+        node->data.doc_get.doc_id = strdup(buffer);
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_upsert(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_UPSERT, "UPSERT/DAL_YA_BADLO");
+    
+    ASTNode *node = create_node(NODE_CMD_DOC_UPSERT);
+    Token *col = consume(ctx, TOKEN_IDENTIFIER, "Collection name");
+    node->data.doc_upsert.collection = strdup(col->value);
+    node->data.doc_upsert.doc_id = NULL;
+    node->data.doc_upsert.filter = NULL;
+    node->data.doc_upsert.update_expr = NULL;
+    
+    // Document body
+    if (current_token(ctx)->type == TOKEN_LBRACE) {
+        char buffer[2048] = "{";
+        consume(ctx, TOKEN_LBRACE, "{");
+        int depth = 1;
+        while (depth > 0 && current_token(ctx)->type != TOKEN_EOF) {
+            if (current_token(ctx)->type == TOKEN_LBRACE) depth++;
+            if (current_token(ctx)->type == TOKEN_RBRACE) depth--;
+            if (depth > 0) {
+                strcat(buffer, current_token(ctx)->value);
+                strcat(buffer, " ");
+            }
+            advance(ctx);
+        }
+        strcat(buffer, "}");
+        node->data.doc_upsert.json_body = strdup(buffer);
+    } else {
+        Token *json = consume(ctx, TOKEN_STRING, "JSON document");
+        node->data.doc_upsert.json_body = strdup(json->value);
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+ASTNode* parse_aggregate(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_AGGREGATE, "AGGREGATE/IKATHA");
+    
+    ASTNode *node = create_node(NODE_CMD_DOC_AGGREGATE);
+    Token *col = consume(ctx, TOKEN_IDENTIFIER, "Collection name");
+    node->data.doc_aggregate.collection = strdup(col->value);
+    node->data.doc_aggregate.stage_count = 0;
+    
+    // Parse pipeline stages as array [ {...}, {...} ]
+    if (current_token(ctx)->type == TOKEN_LBRACKET) {
+        consume(ctx, TOKEN_LBRACKET, "[");
+        
+        int capacity = 8;
+        node->data.doc_aggregate.pipeline_stages = malloc(capacity * sizeof(char*));
+        
+        while (current_token(ctx)->type != TOKEN_RBRACKET && 
+               current_token(ctx)->type != TOKEN_EOF) {
+            
+            if (current_token(ctx)->type == TOKEN_LBRACE) {
+                char buffer[1024] = "{";
+                consume(ctx, TOKEN_LBRACE, "{");
+                int depth = 1;
+                while (depth > 0 && current_token(ctx)->type != TOKEN_EOF) {
+                    if (current_token(ctx)->type == TOKEN_LBRACE) depth++;
+                    if (current_token(ctx)->type == TOKEN_RBRACE) depth--;
+                    if (depth > 0) {
+                        strcat(buffer, current_token(ctx)->value);
+                        strcat(buffer, " ");
+                    }
+                    advance(ctx);
+                }
+                strcat(buffer, "}");
+                
+                if (node->data.doc_aggregate.stage_count >= capacity) {
+                    capacity *= 2;
+                    node->data.doc_aggregate.pipeline_stages = 
+                        realloc(node->data.doc_aggregate.pipeline_stages, 
+                                capacity * sizeof(char*));
+                }
+                node->data.doc_aggregate.pipeline_stages[node->data.doc_aggregate.stage_count++] = 
+                    strdup(buffer);
+            }
+            
+            if (current_token(ctx)->type == TOKEN_COMMA) advance(ctx);
+        }
+        
+        consume(ctx, TOKEN_RBRACKET, "]");
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
     return node;
 }
 
@@ -643,11 +1322,12 @@ ASTNode* parse(TokenList *tokens) {
         if (current_token(&ctx)->type == TOKEN_KW_INDEX) return parse_create_index(&ctx);
         if (current_token(&ctx)->type == TOKEN_KW_USER) return parse_create_user(&ctx);
         if (current_token(&ctx)->type == TOKEN_KW_DATABASE) return parse_create_db(&ctx);
+        if (current_token(&ctx)->type == TOKEN_KW_COLLECTION) return parse_create_collection(&ctx);
         // Table?
         if (current_token(&ctx)->type == TOKEN_KW_TABLE) return parse_create_table(&ctx);
         
         // If simply 'BANAO name ...' (Implicit table creation? No, stay strict)
-        printf("Error: CREATE/BANAO [INDEX|USER|DATABASE|TABLE] expected.\n"); 
+        printf("Error: CREATE/BANAO [INDEX|USER|DATABASE|TABLE|COLLECTION] expected.\n"); 
         return NULL;
     }
     
@@ -683,11 +1363,46 @@ ASTNode* parse(TokenList *tokens) {
         return parse_doc_remove(&ctx);
     } else if (t->type == TOKEN_KW_NIKALO) {
         return parse_delete(&ctx);
+    } else if (t->type == TOKEN_KW_UPDATE) {
+        return parse_update(&ctx);
+    } else if (t->type == TOKEN_KW_GIRAO) {
+        // GIRAO TABLE name  or  DROP TABLE name
+        return parse_drop_table(&ctx);
     } else if (t->type == TOKEN_KW_CHECKPOINT) {
         return parse_checkpoint(&ctx);
     } else if (t->type == TOKEN_KW_INDEX) {
         // "INDEX ON ..."
-        return parse_create_index(&ctx); 
+        return parse_create_index(&ctx);
+    // Transaction Commands
+    } else if (t->type == TOKEN_KW_BEGIN || t->type == TOKEN_KW_START) {
+        return parse_begin(&ctx);
+    } else if (t->type == TOKEN_KW_COMMIT) {
+        return parse_commit(&ctx);
+    } else if (t->type == TOKEN_KW_ROLLBACK) {
+        return parse_rollback(&ctx);
+    } else if (t->type == TOKEN_KW_SAVEPOINT) {
+        return parse_savepoint(&ctx);
+    } else if (t->type == TOKEN_KW_RELEASE) {
+        return parse_release_savepoint(&ctx);
+    // ALTER TABLE (Schema Evolution)
+    } else if (t->type == TOKEN_KW_ALTER) {
+        return parse_alter_table(&ctx);
+    // BACKUP/RESTORE Commands
+    } else if (t->type == TOKEN_KW_BACKUP) {
+        return parse_backup(&ctx);
+    } else if (t->type == TOKEN_KW_RESTORE) {
+        return parse_restore(&ctx);
+    } else if (t->type == TOKEN_KW_EXPORT) {
+        return parse_export(&ctx);
+    } else if (t->type == TOKEN_KW_IMPORT) {
+        return parse_import(&ctx);
+    // NoSQL Commands (MongoDB-style)
+    } else if (t->type == TOKEN_KW_FIND) {
+        return parse_find(&ctx);
+    } else if (t->type == TOKEN_KW_UPSERT) {
+        return parse_upsert(&ctx);
+    } else if (t->type == TOKEN_KW_AGGREGATE) {
+        return parse_aggregate(&ctx);
     } else if (t->type == TOKEN_IDENTIFIER && strcasecmp(t->value, "CREATE") == 0) {
         // Handle standard SQL "CREATE INDEX"
         consume(&ctx, TOKEN_IDENTIFIER, "CREATE");
@@ -780,6 +1495,25 @@ void print_node(ASTNode *node, int level) {
             break;
         case NODE_CMD_DOC_REMOVE:
             printf("DOC REMOVE: %s (ID: %s)\n", node->data.doc_remove.collection, node->data.doc_remove.doc_id);
+            break;
+        // Transaction Commands
+        case NODE_CMD_BEGIN:
+            printf("BEGIN TRANSACTION\n");
+            break;
+        case NODE_CMD_COMMIT:
+            printf("COMMIT\n");
+            break;
+        case NODE_CMD_ROLLBACK:
+            printf("ROLLBACK\n");
+            break;
+        case NODE_CMD_SAVEPOINT:
+            printf("SAVEPOINT: %s\n", node->data.transaction.savepoint_name);
+            break;
+        case NODE_CMD_RELEASE_SAVEPOINT:
+            printf("RELEASE SAVEPOINT: %s\n", node->data.transaction.savepoint_name);
+            break;
+        case NODE_CMD_ROLLBACK_TO:
+            printf("ROLLBACK TO: %s\n", node->data.transaction.savepoint_name);
             break;
         default:
             printf("Unknown Node Type %d\n", node->type);
