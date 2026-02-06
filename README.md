@@ -9,10 +9,7 @@ A distributed database management system implemented in C with Hinglish (Roman-U
 | Metric | Count |
 |--------|-------|
 | Total Source Files | 73 (.c and .h) |
-| Total Lines (with comments and blanks) | 34,981 |
-| Lines of Code (without comments/blanks) | 23,878 |
-| Comment Lines | 5,041 |
-| Blank Lines | 6,062 |
+| Total Lines of Code | 34,981 |
 | Language | C (C99 Standard) |
 | Platforms | Windows, Linux |
 
