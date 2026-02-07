@@ -97,6 +97,40 @@ ASTNode* parse_create_db(ParserContext *ctx) {
     return node;
 }
 
+// DROP DATABASE / GIRAO DATABASE / DATABASE HATAO
+ASTNode* parse_drop_db(ParserContext *ctx) {
+    // Consume DATABASE if present (could come from DROP DATABASE or GIRAO DATABASE)
+    if (current_token(ctx)->type == TOKEN_KW_DATABASE)
+        consume(ctx, TOKEN_KW_DATABASE, "DATABASE");
+    
+    // Allow optional HATAO (DATABASE HATAO <name>)
+    if (current_token(ctx)->type == TOKEN_KW_HATAO)
+        consume(ctx, TOKEN_KW_HATAO, "HATAO");
+    
+    Token *db = consume(ctx, TOKEN_IDENTIFIER, "Database Name");
+    
+    ASTNode *node = create_node(NODE_CMD_DROP_DB);
+    node->data.drop_db.db_name = strdup(db->value);
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+// SHOW DATABASES / DEKHO DATABASES
+ASTNode* parse_show_dbs(ParserContext *ctx) {
+    // "SHOW" already consumed or current is SHOW
+    if (current_token(ctx)->type == TOKEN_KW_show)
+        consume(ctx, TOKEN_KW_show, "SHOW");
+    
+    // consume DATABASES identifier
+    consume(ctx, TOKEN_KW_DATABASE, "DATABASES");
+    
+    ASTNode *node = create_node(NODE_CMD_SHOW_DBS);
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
 ASTNode* parse_show_tables(ParserContext *ctx) {
     consume(ctx, TOKEN_KW_show, "Expected 'SHOW'");
     consume(ctx, TOKEN_KW_TABLES, "Expected 'TABLES'");
@@ -177,10 +211,12 @@ ASTNode* parse_create_table(ParserContext *ctx) {
              longjmp(ctx->env, 1);
         }
 
-        // Check for PRIMARY KEY
+        // Check for PRIMARY KEY or PK shorthand
         int is_pk = 0;
         if (match(ctx, TOKEN_KW_PRIMARY)) {
-            consume(ctx, TOKEN_KW_KEY, "Expected 'KEY' after 'PRIMARY'");
+            // If next token is KEY, consume it (PRIMARY KEY syntax)
+            // Otherwise it was just PK shorthand, already consumed
+            match(ctx, TOKEN_KW_KEY);
             is_pk = 1;
         }
 
@@ -281,10 +317,7 @@ ASTNode* parse_insert(ParserContext *ctx) {
 
 // 3. Select: SELECT cols FROM table [JAHAN expr] [SAMOOH DWARA col]
 ASTNode* parse_select(ParserContext *ctx, int is_subquery) {
-    if (current_token(ctx)->type == TOKEN_KW_DHUNDO)
-        consume(ctx, TOKEN_KW_DHUNDO, "Expected 'DHUNDO'");
-    else
-        consume(ctx, TOKEN_KW_SELECT, "Expected 'SELECT'");
+    consume(ctx, TOKEN_KW_SELECT, "Expected 'SELECT'");
 
     if (current_token(ctx)->type == TOKEN_KW_KARO) {
         consume(ctx, TOKEN_KW_KARO, "Expected 'karo'");
@@ -656,10 +689,17 @@ ASTNode* parse_update(ParserContext *ctx) {
 
 // 7. Drop Table: TABLE GIRAO name  OR  GIRAO TABLE name  OR  DROP TABLE name
 ASTNode* parse_drop_table(ParserContext *ctx) {
-    // Support both "TABLE GIRAO name" and "GIRAO TABLE name"
+    // Support: "DROP TABLE name", "GIRAO TABLE name", "TABLE GIRAO name"
     if (current_token(ctx)->type == TOKEN_KW_TABLE) {
         consume(ctx, TOKEN_KW_TABLE, "TABLE");
-        consume(ctx, TOKEN_KW_GIRAO, "GIRAO/DROP");
+        if (current_token(ctx)->type == TOKEN_KW_GIRAO) {
+            consume(ctx, TOKEN_KW_GIRAO, "GIRAO/DROP");
+        } else if (current_token(ctx)->type == TOKEN_KW_DROP) {
+            consume(ctx, TOKEN_KW_DROP, "DROP");
+        }
+    } else if (current_token(ctx)->type == TOKEN_KW_DROP) {
+        consume(ctx, TOKEN_KW_DROP, "DROP");
+        consume(ctx, TOKEN_KW_TABLE, "TABLE");
     } else {
         consume(ctx, TOKEN_KW_GIRAO, "GIRAO/DROP");
         consume(ctx, TOKEN_KW_TABLE, "TABLE");
@@ -686,6 +726,46 @@ ASTNode* parse_doc_get(ParserContext *ctx) {
     } else if (current_token(ctx)->type == TOKEN_INT_LITERAL) {
          Token *val = consume(ctx, TOKEN_INT_LITERAL, "ID");
          node->data.doc_get.doc_id = strdup(val->value);
+    } else {
+        node->data.doc_get.doc_id = NULL; // Get All
+    }
+    
+    consume(ctx, TOKEN_SEMICOLON, ";");
+    return node;
+}
+
+// 8b. DHUNDO (Hinglish Find): DHUNDO collection [JAHAN id=val];
+// Works as NoSQL doc-get with optional JAHAN filter for id lookup
+ASTNode* parse_dhundo(ParserContext *ctx) {
+    consume(ctx, TOKEN_KW_DHUNDO, "DHUNDO");
+    ASTNode *node = create_node(NODE_CMD_DOC_GET);
+    
+    Token *col = consume(ctx, TOKEN_IDENTIFIER, "Collection Name");
+    node->data.doc_get.collection = strdup(col->value);
+    
+    // Optional JAHAN id=val filter
+    if (match(ctx, TOKEN_KW_JAHAN)) {
+        // Parse "id = value" — extract the value as doc_id
+        consume(ctx, TOKEN_IDENTIFIER, "Column name (id)"); // consume "id"
+        consume(ctx, TOKEN_EQUALS, "=");
+        
+        if (current_token(ctx)->type == TOKEN_INT_LITERAL) {
+            Token *val = consume(ctx, TOKEN_INT_LITERAL, "ID value");
+            node->data.doc_get.doc_id = strdup(val->value);
+        } else if (current_token(ctx)->type == TOKEN_STRING) {
+            Token *val = consume(ctx, TOKEN_STRING, "ID value");
+            node->data.doc_get.doc_id = strdup(val->value);
+        } else {
+            Token *val = consume(ctx, TOKEN_IDENTIFIER, "ID value");
+            node->data.doc_get.doc_id = strdup(val->value);
+        }
+    } else if (current_token(ctx)->type == TOKEN_INT_LITERAL) {
+        // Direct ID: DHUNDO collection 123;
+        Token *val = consume(ctx, TOKEN_INT_LITERAL, "ID");
+        node->data.doc_get.doc_id = strdup(val->value);
+    } else if (current_token(ctx)->type == TOKEN_STRING) {
+        Token *val = consume(ctx, TOKEN_STRING, "ID");
+        node->data.doc_get.doc_id = strdup(val->value);
     } else {
         node->data.doc_get.doc_id = NULL; // Get All
     }
@@ -1332,6 +1412,14 @@ ASTNode* parse(TokenList *tokens) {
     }
     
     if (t->type == TOKEN_KW_show) {
+        // Look ahead to distinguish SHOW TABLES vs SHOW DATABASES
+        if (ctx.tokens->count > ctx.current + 1) {
+            Token *next = &ctx.tokens->tokens[ctx.current + 1];
+            if (next->type == TOKEN_KW_DATABASE) {
+                consume(&ctx, TOKEN_KW_show, "SHOW");
+                return parse_show_dbs(&ctx);
+            }
+        }
         return parse_show_tables(&ctx);
     }
 
@@ -1342,7 +1430,17 @@ ASTNode* parse(TokenList *tokens) {
     
     // Hinglish direct Object-Verb starts
     if (t->type == TOKEN_KW_USER) return parse_create_user(&ctx);
-    if (t->type == TOKEN_KW_DATABASE) return parse_create_db(&ctx);
+    if (t->type == TOKEN_KW_DATABASE) {
+        // Look ahead: DATABASE BANAO=create, DATABASE HATAO=drop, DATABASE <name>=create
+        if (ctx.tokens->count > ctx.current + 1) {
+            Token *next = &ctx.tokens->tokens[ctx.current + 1];
+            if (next->type == TOKEN_KW_HATAO || next->type == TOKEN_KW_GIRAO) {
+                consume(&ctx, TOKEN_KW_DATABASE, "DATABASE");
+                return parse_drop_db(&ctx);
+            }
+        }
+        return parse_create_db(&ctx);
+    }
 
     if (t->type == TOKEN_KW_TABLE) {
         // Check next token to distinguish CREATE vs DROP
@@ -1353,8 +1451,10 @@ ASTNode* parse(TokenList *tokens) {
         return parse_create_table(&ctx);
     } else if (t->type == TOKEN_KW_INSERT) {
         return parse_insert(&ctx);
-    } else if (t->type == TOKEN_KW_SELECT || t->type == TOKEN_KW_DHUNDO) {
+    } else if (t->type == TOKEN_KW_SELECT) {
         return parse_select(&ctx, 0);
+    } else if (t->type == TOKEN_KW_DHUNDO) {
+        return parse_dhundo(&ctx);
     } else if (t->type == TOKEN_KW_RAKHO) {
         return parse_doc_insert(&ctx);
     } else if (t->type == TOKEN_KW_MANGWAO) {
@@ -1365,9 +1465,28 @@ ASTNode* parse(TokenList *tokens) {
         return parse_delete(&ctx);
     } else if (t->type == TOKEN_KW_UPDATE) {
         return parse_update(&ctx);
-    } else if (t->type == TOKEN_KW_GIRAO) {
-        // GIRAO TABLE name  or  DROP TABLE name
+    } else if (t->type == TOKEN_KW_DROP) {
+        // DROP TABLE or DROP DATABASE
+        consume(&ctx, TOKEN_KW_DROP, "DROP");
+        if (current_token(&ctx)->type == TOKEN_KW_DATABASE) {
+            return parse_drop_db(&ctx);
+        }
         return parse_drop_table(&ctx);
+    } else if (t->type == TOKEN_KW_GIRAO) {
+        // GIRAO TABLE or GIRAO DATABASE
+        consume(&ctx, TOKEN_KW_GIRAO, "GIRAO");
+        if (current_token(&ctx)->type == TOKEN_KW_DATABASE) {
+            return parse_drop_db(&ctx);
+        }
+        return parse_drop_table(&ctx);
+    } else if (t->type == TOKEN_KW_DELETE) {
+        // DELETE DATABASE <name> (SQL alias)
+        consume(&ctx, TOKEN_KW_DELETE, "DELETE");
+        if (current_token(&ctx)->type == TOKEN_KW_DATABASE) {
+            return parse_drop_db(&ctx);
+        }
+        printf("Error: DELETE requires DATABASE. For row deletion use NIKALO.\n");
+        return NULL;
     } else if (t->type == TOKEN_KW_CHECKPOINT) {
         return parse_checkpoint(&ctx);
     } else if (t->type == TOKEN_KW_INDEX) {

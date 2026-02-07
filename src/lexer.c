@@ -48,6 +48,7 @@ LexerTokenType check_keyword(const char *str) {
     if (strcasecmp(str, "BOOLEAN") == 0) return TOKEN_KW_BOOL_TYPE;
     if (strcasecmp(str, "AUTO") == 0) return TOKEN_KW_AUTO;
     if (strcasecmp(str, "PRIMARY") == 0) return TOKEN_KW_PRIMARY;
+    if (strcasecmp(str, "PK") == 0) return TOKEN_KW_PRIMARY;
     if (strcasecmp(str, "KEY") == 0) return TOKEN_KW_KEY;
     if (strcasecmp(str, "GIRAO") == 0) return TOKEN_KW_GIRAO;
     if (strcasecmp(str, "MITAO") == 0) return TOKEN_KW_GIRAO; // Alias
@@ -56,7 +57,7 @@ LexerTokenType check_keyword(const char *str) {
     if (strcasecmp(str, "CREATE") == 0) return TOKEN_KW_CREATE;
     if (strcasecmp(str, "USER") == 0) return TOKEN_KW_USER;
     if (strcasecmp(str, "PASSWORD") == 0) return TOKEN_KW_PASSWORD;
-    if (strcasecmp(str, "DATABASE") == 0) return TOKEN_KW_DATABASE;
+    if (strcasecmp(str, "DATABASE") == 0 || strcasecmp(str, "DATABASES") == 0) return TOKEN_KW_DATABASE;
     if (strcasecmp(str, "SHOW") == 0) return TOKEN_KW_show;
     if (strcasecmp(str, "DEKHO") == 0) return TOKEN_KW_show;    // Hinglish SHOW
     if (strcasecmp(str, "TABLES") == 0) return TOKEN_KW_TABLES;
@@ -339,15 +340,15 @@ TokenList* tokenize(const char *input) {
         if (input[i] == '<') { add_token(list, TOKEN_LT, "<", line); i++; continue; }
         if (input[i] == '*') { add_token(list, TOKEN_STAR, "*", line); i++; continue; }
 
-        // Strings with Escape Support
-        if (input[i] == '"') {
+        // Strings with Escape Support (double quotes and single quotes)
+        if (input[i] == '"' || input[i] == '\'') {
+            char quote_char = input[i];
             i++;
-            // int start = i; // Unused
             // First pass: calculate length
             int len = 0;
             int temp_i = i;
             while(input[temp_i] != '\0') {
-                if (input[temp_i] == '"') break;
+                if (input[temp_i] == quote_char) break;
                 if (input[temp_i] == '\\' && input[temp_i+1] != '\0') {
                     temp_i++; // Skip backslash
                 }
@@ -357,13 +358,14 @@ TokenList* tokenize(const char *input) {
             
             char *str = malloc(len + 1);
             int k = 0;
-            while (input[i] != '"' && input[i] != '\0') {
+            while (input[i] != quote_char && input[i] != '\0') {
                 if (input[i] == '\\' && input[i+1] != '\0') {
                     // Handle escape chars
                     i++;
                     if (input[i] == 'n') str[k++] = '\n';
                     else if (input[i] == 't') str[k++] = '\t';
                     else if (input[i] == '"') str[k++] = '"';
+                    else if (input[i] == '\'') str[k++] = '\'';
                     else if (input[i] == '\\') str[k++] = '\\';
                     else str[k++] = input[i]; // Literal otherwise
                 } else {
@@ -375,7 +377,7 @@ TokenList* tokenize(const char *input) {
             
             add_token(list, TOKEN_STRING, str, line);
             free(str);
-            if (input[i] == '"') i++;
+            if (input[i] == quote_char) i++;
             continue;
         }
 

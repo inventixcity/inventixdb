@@ -674,6 +674,7 @@ void execute_select(ASTNode *node, KVStore *store, SessionContext *session, FILE
     resolve_where_clause(node->data.select.where_clause, store, session);
 
     ScanContext ctx;
+    memset(&ctx, 0, sizeof(ScanContext));
     ctx.table_name = node->data.select.table_name;
     ctx.where_clause = node->data.select.where_clause;
     ctx.store = store;
@@ -681,6 +682,9 @@ void execute_select(ASTNode *node, KVStore *store, SessionContext *session, FILE
     ctx.out = out;
     ctx.scan_stop_val = NULL; 
     ctx.scan_col_idx = -1;
+    ctx.capture_mode = 0;
+    ctx.captured_value = NULL;
+    ctx.rows_found = 0;
     
     // Check if buffered mode needed (ORDER BY or LIMIT present)
     int needs_buffering = (node->data.select.order_by_count > 0 || node->data.select.limit > 0);
@@ -1051,13 +1055,54 @@ void execute_show_tables(ASTNode *node, KVStore *store, SessionContext *ctx, FIL
     sys_show_tables(store, ctx->current_db, out);
 }
 
+void execute_drop_db(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    char *dbname = node->data.drop_db.db_name;
+    
+    // Cannot drop 'public'
+    if (strcmp(dbname, "public") == 0) {
+        fprintf(out, ANSI_RED "Error: Cannot drop the default database 'public'.\n" ANSI_RESET);
+        return;
+    }
+    
+    // Cannot drop database you're currently using
+    if (strcmp(dbname, ctx->current_db) == 0) {
+        fprintf(out, ANSI_RED "Error: Cannot drop database '%s' — you are currently using it. Switch first with USE <other_db>.\n" ANSI_RESET, dbname);
+        return;
+    }
+    
+    int result = sys_drop_db(store, dbname);
+    if (result == 1) {
+        fprintf(out, ANSI_GREEN "Database '%s' dropped successfully.\n" ANSI_RESET, dbname);
+    } else if (result == 0) {
+        fprintf(out, "Error: Database '%s' does not exist.\n", dbname);
+    } else {
+        fprintf(out, ANSI_RED "Error: Cannot drop database '%s'.\n" ANSI_RESET, dbname);
+    }
+}
+
+void execute_show_dbs(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
+    (void)node;
+    (void)ctx;
+    sys_show_dbs(store, out);
+}
+
 void execute_doc_insert(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out) {
-    int id = rand() % 10000;
+    // Use sequential document ID instead of random
+    char seqKeyBuf[256];
+    sprintf(seqKeyBuf, "DB:%s:DOC_SEQ:%s", ctx->current_db, node->data.doc_insert.collection);
+    
+    int next_id = 1;
+    Value *seqVal = kv_get(store, seqKeyBuf);
+    if (seqVal && seqVal->data) {
+        next_id = (*(int*)seqVal->data) + 1;
+    }
+    kv_put(store, seqKeyBuf, &next_id, sizeof(int), VAL_TYPE_ROW);
+    
     char key[256];
-    sprintf(key, "DB:%s:DOC:%s:%d", ctx->current_db, node->data.doc_insert.collection, id);
+    sprintf(key, "DB:%s:DOC:%s:%d", ctx->current_db, node->data.doc_insert.collection, next_id);
     
     kv_put(store, key, node->data.doc_insert.json_body, strlen(node->data.doc_insert.json_body)+1, VAL_TYPE_JSON);
-    fprintf(out, "Document saved with key: %s\n", key);
+    fprintf(out, "Document saved (ID: %d) key: %s\n", next_id, key);
 }
 
 // Callback for MANGWAO (Get All)
@@ -1157,23 +1202,28 @@ void execute_update(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *ou
         return;
     }
     
-    // Parse column names from schema (format: "col1:type,col2:type,...")
+    // Parse column names from schema (format: "col1:type[:PK];col2:type;...")
     char *schema_copy = strdup((char*)schemaVal->data);
     char *col_names[64];
     char *col_types[64];
     int col_count = 0;
     
     char *saveptr;
-    char *col_def = strtok_r(schema_copy, ",", &saveptr);
+    char *col_def = strtok_r(schema_copy, ";", &saveptr);
     while (col_def && col_count < 64) {
+        if (strlen(col_def) == 0) { col_def = strtok_r(NULL, ";", &saveptr); continue; }
         char *colon = strchr(col_def, ':');
         if (colon) {
             *colon = '\0';
             col_names[col_count] = strdup(col_def);
-            col_types[col_count] = strdup(colon + 1);
+            // Strip :PK suffix if present (e.g. "INT:PK" -> "INT")
+            char *type_start = colon + 1;
+            char *pk_marker = strstr(type_start, ":PK");
+            if (pk_marker) *pk_marker = '\0';
+            col_types[col_count] = strdup(type_start);
             col_count++;
         }
-        col_def = strtok_r(NULL, ",", &saveptr);
+        col_def = strtok_r(NULL, ";", &saveptr);
     }
     free(schema_copy);
     free(metaKey);
@@ -1225,16 +1275,14 @@ void execute_update(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *ou
                     return;
                 }
                 
-                // Parse existing row (simple CSV format assumed)
-                char *row_copy = strdup((char*)row_val->data);
-                char *values[64];
+                // Parse existing row using binary deserialization
                 int val_count = 0;
-                
-                char *val_saveptr;
-                char *val = strtok_r(row_copy, "|", &val_saveptr);
-                while (val && val_count < 64) {
-                    values[val_count++] = strdup(val);
-                    val = strtok_r(NULL, "|", &val_saveptr);
+                char **values = row_deserialize(row_val->data, row_val->size, &val_count);
+                if (!values) {
+                    fprintf(out, "Error: Could not deserialize row data.\n");
+                    free(key);
+                    for (int j = 0; j < col_count; j++) { free(col_names[j]); free(col_types[j]); }
+                    return;
                 }
                 
                 // Log old value for transaction rollback
@@ -1253,17 +1301,39 @@ void execute_update(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *ou
                     }
                 }
                 
-                // Build new row
-                char new_row[4096] = {0};
+                // Build new row using binary serialization
+                NodeList *head = NULL, *tail = NULL;
                 for (int i = 0; i < val_count; i++) {
-                    if (i > 0) strcat(new_row, "|");
-                    strcat(new_row, values[i]);
-                    free(values[i]);
+                    NodeList *item = malloc(sizeof(NodeList));
+                    item->value = values[i]; // transfer ownership
+                    item->func_type = 0;
+                    item->next = NULL;
+                    if (!head) head = item; else tail->next = item;
+                    tail = item;
                 }
-                free(row_copy);
+                
+                size_t new_size;
+                void *new_row = row_serialize(head, &new_size);
+                
+                // Free the NodeList (values were transferred, don't double-free)
+                NodeList *curr = head;
+                while (curr) {
+                    NodeList *next = curr->next;
+                    free(curr->value);
+                    free(curr);
+                    curr = next;
+                }
+                
+                if (!new_row) {
+                    fprintf(out, "Error: Could not serialize updated row.\n");
+                    free(key);
+                    for (int j = 0; j < col_count; j++) { free(col_names[j]); free(col_types[j]); }
+                    return;
+                }
                 
                 // Store updated row
-                kv_put(store, key, (uint8_t*)new_row, strlen(new_row) + 1, VAL_TYPE_ROW);
+                kv_put(store, key, new_row, new_size, VAL_TYPE_ROW);
+                free(new_row);
                 fprintf(out, "Updated 1 row in '%s'.\n", table_name);
                 
                 free(key);
@@ -1792,6 +1862,12 @@ void execute_query(ASTNode *node, KVStore *store, SessionContext *ctx, FILE *out
         case NODE_CMD_USE_DB:
              execute_use_db(node, store, ctx, out);
              break;
+        case NODE_CMD_DROP_DB:
+            execute_drop_db(node, store, ctx, out);
+            break;
+        case NODE_CMD_SHOW_DBS:
+            execute_show_dbs(node, store, ctx, out);
+            break;
         // Transaction Commands
         case NODE_CMD_BEGIN:
             execute_begin(node, store, ctx, out);

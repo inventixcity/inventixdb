@@ -88,7 +88,7 @@ TARGET_TEST_RUNNER = test_runner
 
 all: $(TARGET_CLI) $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_TEST_BTREE)
 
-$(TARGET_CLI): $(OBJ_COMMON) $(OBJ_CLI) $(OBJ_STORAGE_BTREE) $(OBJ_PREPARED) $(OBJ_INDEX) $(OBJ_OPTIMIZER) $(OBJ_JOIN) $(OBJ_MVCC) $(OBJ_QUERY_RESULT) $(OBJ_BACKUP) $(OBJ_NOSQL) $(OBJ_SAFE_MEM) $(OBJ_ERROR) $(OBJ_TIMEOUT)
+$(TARGET_CLI): $(OBJ_COMMON) $(OBJ_CLI) $(OBJ_STORAGE_BTREE) $(OBJ_SECURITY) $(OBJ_PREPARED) $(OBJ_INDEX) $(OBJ_OPTIMIZER) $(OBJ_JOIN) $(OBJ_MVCC) $(OBJ_QUERY_RESULT) $(OBJ_BACKUP) $(OBJ_NOSQL) $(OBJ_SAFE_MEM) $(OBJ_ERROR) $(OBJ_TIMEOUT)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(TARGET_SERVER): $(OBJ_COMMON) $(OBJ_SERVER) $(OBJ_STORAGE_BTREE) $(OBJ_CLUSTER) $(OBJ_SECURITY) $(OBJ_MEMORY) $(OBJ_NETWORK) $(OBJ_PREPARED) $(OBJ_INDEX) $(OBJ_OPTIMIZER) $(OBJ_JOIN) $(OBJ_MVCC) $(OBJ_QUERY_RESULT) $(OBJ_BACKUP) $(OBJ_NOSQL) $(OBJ_SAFE_MEM) $(OBJ_ERROR) $(OBJ_TIMEOUT)
@@ -128,17 +128,39 @@ tests/test_network.o: tests/test_network.c
 tests/test_crash_recovery.o: tests/test_crash_recovery.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+ifeq ($(OS),Windows_NT)
+    RM = del /q /f
+    RMOBJ = if exist src\*.o del /q /f src\*.o
+    RMTESTOBJ = if exist tests\*.o del /q /f tests\*.o
+    RMEXE = if exist *.exe del /q /f *.exe
+else
+    RM = rm -f
+    RMOBJ = rm -f src/*.o
+    RMTESTOBJ = rm -f tests/*.o
+    RMEXE = rm -f *.exe
+endif
+
 clean:
-	rm -f src/*.o tests/*.o $(TARGET_CLI) $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_TEST_BTREE) $(TARGET_TEST_RUNNER) test_memory test_network test_crash_recovery *.exe
+	$(RMOBJ)
+	$(RMTESTOBJ)
+	$(RMEXE)
 
 # ============================================================================
 # TEST TARGETS
 # ============================================================================
+ifeq ($(OS),Windows_NT)
+    EXE_EXT = .exe
+    RUN_PREFIX =
+else
+    EXE_EXT =
+    RUN_PREFIX = ./
+endif
+
 test: $(TARGET_TEST_BTREE) $(TARGET_CLI)
 	@echo "--- Testing B+ Tree Storage Engine ---"
-	./$(TARGET_TEST_BTREE)
+	$(RUN_PREFIX)$(TARGET_TEST_BTREE)$(EXE_EXT)
 	@echo "--- Testing Parser/Executor (Hinglish Support) ---"
-	./$(TARGET_CLI) < test_hinglish_oneline.sql
+	$(RUN_PREFIX)$(TARGET_CLI)$(EXE_EXT) < test_hinglish_oneline.sql
 
 # Run test suite
 test-suite: $(TARGET_TEST_RUNNER)
@@ -147,17 +169,17 @@ test-suite: $(TARGET_TEST_RUNNER)
 	@echo "  Running Test Suite"
 	@echo "=========================================="
 	@echo ""
-	./$(TARGET_TEST_RUNNER) -v
+	$(RUN_PREFIX)$(TARGET_TEST_RUNNER)$(EXE_EXT) -v
 
 # Run individual test suites
 test-memory: test_memory
-	./test_memory
+	$(RUN_PREFIX)test_memory$(EXE_EXT)
 
 test-network-suite: test_network
-	./test_network
+	$(RUN_PREFIX)test_network$(EXE_EXT)
 
 test-crash: test_crash_recovery
-	./test_crash_recovery
+	$(RUN_PREFIX)test_crash_recovery$(EXE_EXT)
 
 # Run all tests
 test-all: test test-suite
@@ -169,6 +191,6 @@ test-all: test test-suite
 # Cluster testing
 test-cluster: $(TARGET_SERVER) $(TARGET_CLIENT)
 	@echo "--- Starting cluster nodes ---"
-	@echo "Run: ./$(TARGET_SERVER) --master --port 9876"
-	@echo "Run: ./$(TARGET_SERVER) --worker --port 9877"
-	@echo "Run: ./$(TARGET_CLIENT) -h 127.0.0.1 -p 9876"
+	@echo "Run: $(RUN_PREFIX)$(TARGET_SERVER)$(EXE_EXT) --master --port 9876"
+	@echo "Run: $(RUN_PREFIX)$(TARGET_SERVER)$(EXE_EXT) --worker --port 9877"
+	@echo "Run: $(RUN_PREFIX)$(TARGET_CLIENT)$(EXE_EXT) -h 127.0.0.1 -p 9876"

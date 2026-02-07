@@ -7,6 +7,8 @@
 void sys_init(KVStore *store);
 int sys_create_db(KVStore *store, const char *dbname);
 int sys_db_exists(KVStore *store, const char *dbname);
+int sys_drop_db(KVStore *store, const char *dbname);
+void sys_show_dbs(KVStore *store, FILE *out);
 void sys_show_tables(KVStore *store, const char *current_db, FILE *out);
 
 // Key Generation Helper (Namespaced)

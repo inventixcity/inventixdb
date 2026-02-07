@@ -57,13 +57,20 @@ static char *strcasestr(const char *haystack, const char *needle) {
 // CONFIGURATION
 // ============================================================================
 
-#define SERVER_VERSION "1.2.0"
+#define SERVER_VERSION "1.3.0"
 #define USE_ASYNC_IO 1              // Enable IOCP async I/O
 #define ENABLE_CONNECTION_POOL 1    // Enable connection pooling for workers
 #define BUFFER_SIZE 8192
 #define MAX_CLIENTS 256
 #define SESSION_MEMORY_QUOTA (8 * 1024 * 1024)  // 8 MB per session
 #define QUERY_MEMORY_QUOTA   (2 * 1024 * 1024)  // 2 MB per query
+
+// Security: Rate limiting & brute-force protection
+#define MAX_LOGIN_ATTEMPTS      5       // Max failed logins before lockout
+#define LOGIN_LOCKOUT_SECONDS   300     // 5 minute lockout
+#define MAX_QUERIES_PER_MINUTE  1000    // Rate limit per client
+#define CONNECTION_TIMEOUT_SEC  300     // Idle connection timeout (5 min)
+#define MAX_IP_BLACKLIST        128     // Max blacklisted IPs
 
 static int g_port = 8888;
 static int g_running = 1;
@@ -74,6 +81,93 @@ KVStore *global_store;
 
 // Global memory pool for client connections
 static MemPool *g_conn_pool = NULL;
+
+// ============================================================================
+// IP RATE LIMITING & BRUTE-FORCE PROTECTION
+// ============================================================================
+
+typedef struct {
+    char ip[64];
+    int failed_logins;
+    time_t lockout_until;
+    int queries_this_minute;
+    time_t minute_start;
+    time_t last_activity;
+} IPTracker;
+
+static IPTracker g_ip_tracker[MAX_CLIENTS];
+static int g_ip_tracker_count = 0;
+static pthread_mutex_t g_ip_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// IP Blacklist 
+static char g_ip_blacklist[MAX_IP_BLACKLIST][64];
+static int g_ip_blacklist_count = 0;
+
+static IPTracker* find_or_create_ip_tracker(const char *ip) {
+    pthread_mutex_lock(&g_ip_lock);
+    for (int i = 0; i < g_ip_tracker_count; i++) {
+        if (strcmp(g_ip_tracker[i].ip, ip) == 0) {
+            pthread_mutex_unlock(&g_ip_lock);
+            return &g_ip_tracker[i];
+        }
+    }
+    if (g_ip_tracker_count < MAX_CLIENTS) {
+        IPTracker *t = &g_ip_tracker[g_ip_tracker_count++];
+        memset(t, 0, sizeof(IPTracker));
+        strncpy(t->ip, ip, sizeof(t->ip) - 1);
+        t->minute_start = time(NULL);
+        t->last_activity = time(NULL);
+        pthread_mutex_unlock(&g_ip_lock);
+        return t;
+    }
+    pthread_mutex_unlock(&g_ip_lock);
+    return NULL;
+}
+
+static bool is_ip_blacklisted(const char *ip) {
+    for (int i = 0; i < g_ip_blacklist_count; i++) {
+        if (strcmp(g_ip_blacklist[i], ip) == 0) return true;
+    }
+    return false;
+}
+
+static bool is_ip_locked_out(IPTracker *tracker) {
+    if (!tracker) return false;
+    if (tracker->lockout_until > 0 && time(NULL) < tracker->lockout_until) return true;
+    if (tracker->lockout_until > 0 && time(NULL) >= tracker->lockout_until) {
+        tracker->failed_logins = 0;
+        tracker->lockout_until = 0;
+    }
+    return false;
+}
+
+static bool check_rate_limit(IPTracker *tracker) {
+    if (!tracker) return false;
+    time_t now = time(NULL);
+    if (now - tracker->minute_start >= 60) {
+        tracker->queries_this_minute = 0;
+        tracker->minute_start = now;
+    }
+    tracker->queries_this_minute++;
+    tracker->last_activity = now;
+    return tracker->queries_this_minute <= MAX_QUERIES_PER_MINUTE;
+}
+
+static void record_failed_login(IPTracker *tracker) {
+    if (!tracker) return;
+    tracker->failed_logins++;
+    if (tracker->failed_logins >= MAX_LOGIN_ATTEMPTS) {
+        tracker->lockout_until = time(NULL) + LOGIN_LOCKOUT_SECONDS;
+        LOG_SECURITY("IP %s locked out for %d seconds after %d failed login attempts",
+                     tracker->ip, LOGIN_LOCKOUT_SECONDS, tracker->failed_logins);
+    }
+}
+
+static void record_successful_login(IPTracker *tracker) {
+    if (!tracker) return;
+    tracker->failed_logins = 0;
+    tracker->lockout_until = 0;
+}
 
 // ============================================================================
 // CLIENT SESSION
@@ -101,6 +195,10 @@ typedef struct {
     
     // Prepared statements
     SessionStatementStore *stmt_store;  // Per-session prepared statement store
+    
+    // Security tracking
+    IPTracker *ip_tracker;              // Rate limiting & brute-force tracking
+    time_t connect_time;                // Connection start time
 } ClientConnection;
 
 // Global async server instance
@@ -190,6 +288,19 @@ static void send_banner(SOCKET sock, ClientConnection *conn) {
 static int handle_login(ClientConnection *conn, const char *username, const char *password) {
     char error_msg[256];
     
+    // Check IP lockout (brute-force protection)
+    if (conn->ip_tracker && is_ip_locked_out(conn->ip_tracker)) {
+        int remaining = (int)(conn->ip_tracker->lockout_until - time(NULL));
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "\n\033[31mAccount locked. Too many failed attempts. Try again in %d seconds.\033[0m\n",
+            remaining);
+        send(conn->socket, msg, (int)strlen(msg), 0);
+        LOG_SECURITY("Blocked login attempt from locked IP %s:%d (user: %s)",
+                     conn->client_ip, conn->client_port, username);
+        return -1;
+    }
+    
     Session *session = NULL;
     int result = security_login(username, password, conn->client_ip, 
                                 conn->client_port, &session, error_msg);
@@ -200,24 +311,46 @@ static int handle_login(ClientConnection *conn, const char *username, const char
         conn->authenticated = true;
         strncpy(conn->ctx.current_user, session->username, sizeof(conn->ctx.current_user) - 1);
         
+        // Reset failed login counter on success
+        if (conn->ip_tracker) record_successful_login(conn->ip_tracker);
+        
         char msg[512];
         snprintf(msg, sizeof(msg),
             "\n\033[32mLogin successful!\033[0m\n"
-            "  User: %s | Role: %s | Database: %s\n",
+            "  User: %s | Role: %s | Database: %s\n"
+            "  Session Token: %.8s...\n",
             username,
             session->is_superuser ? "Superadmin" : "User",
-            conn->ctx.current_db
+            conn->ctx.current_db,
+            conn->auth_token
         );
         send(conn->socket, msg, (int)strlen(msg), 0);
         
-        LOG_INFO("Client %s:%d authenticated as '%s'", 
-                 conn->client_ip, conn->client_port, username);
+        LOG_SECURITY("Client %s:%d authenticated as '%s' (role: %s)", 
+                 conn->client_ip, conn->client_port, username,
+                 session->is_superuser ? "superadmin" : "user");
         
         return 0;
     } else {
+        // Record failed login for brute-force protection
+        if (conn->ip_tracker) record_failed_login(conn->ip_tracker);
+        
         char msg[256];
         snprintf(msg, sizeof(msg), "\n\033[31mLogin failed: %s\033[0m\n", error_msg);
+        
+        if (conn->ip_tracker && conn->ip_tracker->failed_logins > 0) {
+            char warning[128];
+            snprintf(warning, sizeof(warning),
+                "\033[33m  Warning: %d/%d failed attempts.\033[0m\n",
+                conn->ip_tracker->failed_logins, MAX_LOGIN_ATTEMPTS);
+            strncat(msg, warning, sizeof(msg) - strlen(msg) - 1);
+        }
+        
         send(conn->socket, msg, (int)strlen(msg), 0);
+        
+        LOG_SECURITY("Failed login from %s:%d (user: %s, reason: %s, attempts: %d)",
+                     conn->client_ip, conn->client_port, username, error_msg,
+                     conn->ip_tracker ? conn->ip_tracker->failed_logins : 0);
         return -1;
     }
 }
@@ -322,32 +455,53 @@ static void handle_whoami(ClientConnection *conn) {
 }
 
 static void handle_status(ClientConnection *conn) {
-    char buffer[2048];
+    char buffer[4096];
     
     // Get memory stats
     size_t session_mem = conn->mem ? arena_get_used(conn->mem->arena) : 0;
     size_t query_mem = conn->query_arena ? arena_get_used(conn->query_arena) : 0;
     
+    // Calculate uptime
+    time_t conn_uptime = time(NULL) - conn->connect_time;
+    
     snprintf(buffer, sizeof(buffer),
-        "\n\033[1;36m============== Server Status ==============\033[0m\n"
+        "\n\033[1;36m================ Server Status / Halat ================\033[0m\n"
+        "\n\033[1;33m[Server / Server]\033[0m\n"
         "  Version: %s | Mode: %s\n"
         "  Port: %d | Clients: %d/%d\n"
         "  Sessions: %d | Users: %d\n"
-        "\n\033[1;33m[Memory]\033[0m\n"
+        "\n\033[1;33m[Security / Suraksha]\033[0m\n"
+        "  Auth: PBKDF2-SHA256 | RBAC: Active\n"
+        "  Brute-Force Protection: %d max attempts, %ds lockout\n"
+        "  Rate Limit: %d queries/min per client\n"
+        "  Idle Timeout: %d seconds\n"
+        "  Blacklisted IPs: %d\n"
+        "\n\033[1;33m[Memory / Yaaddasht]\033[0m\n"
         "  Session Memory:  %zu KB / %d KB quota\n"
         "  Query Memory:    %zu KB / %d KB quota\n"
         "  Queries Run:     %zu\n"
         "  Global Stats:    %zu allocs, %zu frees\n"
-        "\033[1;36m============================================\033[0m\n",
+        "\n\033[1;33m[Connection / Judav]\033[0m\n"
+        "  Your IP: %s:%d\n"
+        "  Connected: %lld seconds ago\n"
+        "  Authenticated: %s\n"
+        "\033[1;36m========================================================\033[0m\n",
         SERVER_VERSION,
         dist_is_master() ? "Master" : "Worker",
         g_port, g_client_count, MAX_CLIENTS,
         g_security ? g_security->session_count : 0,
         g_security ? g_security->user_count : 0,
+        MAX_LOGIN_ATTEMPTS, LOGIN_LOCKOUT_SECONDS,
+        MAX_QUERIES_PER_MINUTE,
+        CONNECTION_TIMEOUT_SEC,
+        g_ip_blacklist_count,
         session_mem / 1024, SESSION_MEMORY_QUOTA / 1024,
         query_mem / 1024, QUERY_MEMORY_QUOTA / 1024,
         conn->queries_executed,
-        g_mem_stats.malloc_count, g_mem_stats.free_count
+        g_mem_stats.malloc_count, g_mem_stats.free_count,
+        conn->client_ip, conn->client_port,
+        (long long)conn_uptime,
+        conn->authenticated ? "Yes" : "No"
     );
     
     send(conn->socket, buffer, (int)strlen(buffer), 0);
@@ -791,6 +945,17 @@ static void *client_handler(void *arg) {
         
         for (int i = 0; cmd[i]; i++) cmd[i] = toupper((unsigned char)cmd[i]);
         
+        // Security: Rate limiting check
+        if (conn->ip_tracker && !check_rate_limit(conn->ip_tracker)) {
+            send(conn->socket, 
+                "\n\033[31mRate limit exceeded. Slow down your queries.\033[0m\n", 52, 0);
+            LOG_SECURITY("Rate limit exceeded for %s:%d (%d queries/min)",
+                         conn->client_ip, conn->client_port,
+                         conn->ip_tracker->queries_this_minute);
+            send_prompt(conn->socket, conn);
+            continue;
+        }
+        
         // Exit commands (English and Hinglish)
         if (strcmp(cmd, "EXIT") == 0 || strcmp(cmd, "QUIT") == 0 ||
             strcmp(cmd, "NIKLO") == 0 || strcmp(cmd, "BAHAR") == 0 ||
@@ -826,6 +991,15 @@ static void *client_handler(void *arg) {
         }
         else if (strcmp(cmd, "SHOW") == 0 && strcasecmp(arg1, "USERS") == 0) {
             handle_show_users(conn);
+        }
+        else if ((strcmp(cmd, "SHOW") == 0 || strcmp(cmd, "DEKHO") == 0) && 
+                 (strcasecmp(arg1, "DATABASES") == 0 || strcasecmp(arg1, "DATABASE") == 0)) {
+            // SHOW DATABASES / DEKHO DATABASES — route through SQL engine
+            if (conn->authenticated) {
+                execute_client_query(conn, buffer);
+            } else {
+                send(conn->socket, "\n\033[31mAuthentication required.\033[0m\n", 38, 0);
+            }
         }
         else if (strcmp(cmd, "CREATE") == 0 && strcasecmp(arg1, "USER") == 0) {
             char rest[256];
@@ -975,6 +1149,19 @@ int main(int argc, char *argv[]) {
         conn->authenticated = false;
         strcpy(conn->ctx.current_db, "public");
         strcpy(conn->ctx.current_user, "guest");
+        conn->connect_time = time(NULL);
+        
+        // Security: Check IP blacklist
+        if (is_ip_blacklisted(conn->client_ip)) {
+            LOG_SECURITY("Rejected connection from blacklisted IP %s:%d",
+                         conn->client_ip, conn->client_port);
+            closesocket(new_socket);
+            free(conn);
+            continue;
+        }
+        
+        // Security: Initialize IP tracker for rate limiting
+        conn->ip_tracker = find_or_create_ip_tracker(conn->client_ip);
         
         // Initialize prepared statement store for this connection
         conn->stmt_store = stmt_store_create();

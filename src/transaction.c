@@ -278,9 +278,11 @@ int txn_rollback(KVStore *store) {
             case TXN_OP_CREATE_TABLE:
                 // Undo create table by dropping it
                 if (op->table_name) {
-                    char schema_key[256];
+                    char schema_key[512];
                     snprintf(schema_key, sizeof(schema_key), 
-                             "__schema__%s", op->table_name);
+                             "DB:%s:META:TBL:%s",
+                             txn->database ? txn->database : "public",
+                             op->table_name);
                     kv_delete(store, schema_key);
                     undo_count++;
                 }
@@ -289,9 +291,11 @@ int txn_rollback(KVStore *store) {
             case TXN_OP_DROP_TABLE:
                 // Undo drop table by recreating schema
                 if (op->table_name && op->schema_json) {
-                    char schema_key[256];
+                    char schema_key[512];
                     snprintf(schema_key, sizeof(schema_key),
-                             "__schema__%s", op->table_name);
+                             "DB:%s:META:TBL:%s",
+                             txn->database ? txn->database : "public",
+                             op->table_name);
                     kv_put(store, schema_key, op->schema_json,
                            strlen(op->schema_json) + 1, VAL_TYPE_SCHEMA);
                     undo_count++;

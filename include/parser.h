@@ -20,6 +20,8 @@ typedef enum {
     NODE_CMD_CREATE_DB,   // CREATE DATABASE
     NODE_CMD_SHOW_TABLES, // SHOW TABLES
     NODE_CMD_USE_DB,      // USE <db>
+    NODE_CMD_DROP_DB,     // DROP DATABASE / GIRAO DATABASE / DATABASE HATAO
+    NODE_CMD_SHOW_DBS,    // SHOW DATABASES / DEKHO DATABASES
 
     // Transaction Commands
     NODE_CMD_BEGIN,      // BEGIN / START TRANSACTION
@@ -180,6 +182,10 @@ struct ASTNode {
         struct {
             char *db_name;
         } use_db;
+
+        struct {
+            char *db_name;
+        } drop_db;
 
         struct {
             char *collection;
