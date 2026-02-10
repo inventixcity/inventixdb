@@ -621,17 +621,70 @@ static void handle_create_user(ClientConnection *conn, const char *args) {
         return;
     }
     
-    char username[64], password[64], role[32] = "";
-    sscanf(args, "%63s %63s %31s", username, password, role);
+    // Parse: <username> PASSWORD '<password>' [ROLE <role>][;]
+    char username[64] = "", password[64] = "", role[32] = "";
+    
+    // Extract username (first word)
+    const char *p = args;
+    while (*p && isspace(*p)) p++;
+    int i = 0;
+    while (*p && !isspace(*p) && i < 63) username[i++] = *p++;
+    username[i] = '\0';
+    
+    // Look for PASSWORD keyword
+    const char *pw_start = strcasestr(p, "PASSWORD");
+    if (pw_start) {
+        pw_start += 8; // skip "PASSWORD"
+        while (*pw_start && isspace(*pw_start)) pw_start++;
+        
+        // Handle quoted password: 'xxx' or "xxx"
+        if (*pw_start == '\'' || *pw_start == '"') {
+            char quote = *pw_start++;
+            i = 0;
+            while (*pw_start && *pw_start != quote && i < 63) {
+                password[i++] = *pw_start++;
+            }
+            password[i] = '\0';
+        } else {
+            // Unquoted — read until space
+            i = 0;
+            while (*pw_start && !isspace(*pw_start) && *pw_start != ';' && i < 63) {
+                password[i++] = *pw_start++;
+            }
+            password[i] = '\0';
+        }
+    } else {
+        // Fallback: second word is password (old format)
+        while (*p && isspace(*p)) p++;
+        i = 0;
+        while (*p && !isspace(*p) && i < 63) password[i++] = *p++;
+        password[i] = '\0';
+    }
+    
+    // Look for ROLE keyword
+    const char *role_start = strcasestr(args, "ROLE");
+    if (role_start && role_start != args) { // make sure ROLE is not part of username
+        role_start += 4; // skip "ROLE"
+        while (*role_start && isspace(*role_start)) role_start++;
+        i = 0;
+        while (*role_start && !isspace(*role_start) && *role_start != ';' && i < 31) {
+            role[i++] = *role_start++;
+        }
+        role[i] = '\0';
+    }
     
     if (strlen(role) == 0) strcpy(role, ROLE_GUEST);
+    if (strlen(username) == 0 || strlen(password) == 0) {
+        send(conn->socket, "\n\033[31mSyntax: CREATE USER <name> PASSWORD '<pass>' [ROLE <role>]\033[0m\n", 70, 0);
+        return;
+    }
     
     char error[128];
     int user_id = security_create_user(username, password, role, error);
     
     char msg[256];
     if (user_id >= 0) {
-        snprintf(msg, sizeof(msg), "\n\033[32mUser '%s' created.\033[0m\n", username);
+        snprintf(msg, sizeof(msg), "\n\033[32mUser '%s' created (role: %s).\033[0m\n", username, role);
     } else {
         snprintf(msg, sizeof(msg), "\n\033[31mFailed: %s\033[0m\n", error);
     }
@@ -862,6 +915,8 @@ static void execute_client_query(ClientConnection *conn, const char *query) {
     
     ASTNode *ast = parse(tokens);
     if (ast) {
+        LOG_DEBUG("Executing query type=%d for %s:%d", ast->type,
+                 conn->client_ip, conn->client_port);
         if (dist_is_master()) {
             char *resp = dist_route_query(ast, query);
             if (resp) {
@@ -873,16 +928,36 @@ static void execute_client_query(ClientConnection *conn, const char *query) {
             FILE *fp = tmpfile();
             if (fp) {
                 execute_query(ast, global_store, &conn->ctx, fp);
+                
+                // Get the size of the response
+                fseek(fp, 0, SEEK_END);
+                long resp_size = ftell(fp);
                 fseek(fp, 0, SEEK_SET);
                 
-                char out_buf[BUFFER_SIZE];
-                send(conn->socket, "\n", 1, 0);
-                while (fgets(out_buf, BUFFER_SIZE, fp)) {
-                    send(conn->socket, out_buf, (int)strlen(out_buf), 0);
+                // Buffer entire response and send in one call
+                if (resp_size > 0) {
+                    char *resp_buf = malloc(resp_size + 2);  // +2 for \n prefix
+                    if (resp_buf) {
+                        resp_buf[0] = '\n';
+                        size_t nread = fread(resp_buf + 1, 1, resp_size, fp);
+                        resp_buf[1 + nread] = '\0';
+                        send(conn->socket, resp_buf, (int)(1 + nread), 0);
+                        free(resp_buf);
+                    } else {
+                        // Fallback: send line by line
+                        char out_buf[BUFFER_SIZE];
+                        send(conn->socket, "\n", 1, 0);
+                        while (fgets(out_buf, BUFFER_SIZE, fp)) {
+                            send(conn->socket, out_buf, (int)strlen(out_buf), 0);
+                        }
+                    }
                 }
                 fclose(fp);
+            } else {
+                send(conn->socket, "\n\033[31mServer error: tmpfile() failed.\033[0m\n", 42, 0);
             }
         }
+        free_ast(ast);
     } else {
         send(conn->socket, "\n\033[31mParse error.\033[0m\n", 24, 0);
     }
@@ -926,7 +1001,13 @@ static void *client_handler(void *arg) {
               conn->client_ip, conn->client_port, SESSION_MEMORY_QUOTA / 1024);
     
     send_banner(conn->socket, conn);
-    send_prompt(conn->socket, conn);
+    // Combine prompt + EOF into one send for instant delivery
+    {
+        char init_prompt[256];
+        snprintf(init_prompt, sizeof(init_prompt),
+            "\n\033[33m[not authenticated]\033[0m inventix> <<EOF>>");
+        send(conn->socket, init_prompt, (int)strlen(init_prompt), 0);
+    }
     
     while (g_running) {
         memset(buffer, 0, BUFFER_SIZE);
@@ -936,7 +1017,18 @@ static void *client_handler(void *arg) {
         
         buffer[strcspn(buffer, "\r\n")] = 0;
         if (strlen(buffer) == 0) {
-            send_prompt(conn->socket, conn);
+            // Combined prompt + EOF in single send
+            char prompt_buf[256];
+            if (!conn->authenticated) {
+                snprintf(prompt_buf, sizeof(prompt_buf), 
+                    "\n\033[33m[not authenticated]\033[0m inventix> <<EOF>>");
+            } else {
+                snprintf(prompt_buf, sizeof(prompt_buf),
+                    "\n\033[32m[%s@%s]\033[0m inventix> <<EOF>>",
+                    conn->session ? conn->session->username : "unknown",
+                    conn->ctx.current_db);
+            }
+            send(conn->socket, prompt_buf, (int)strlen(prompt_buf), 0);
             continue;
         }
         
@@ -953,6 +1045,7 @@ static void *client_handler(void *arg) {
                          conn->client_ip, conn->client_port,
                          conn->ip_tracker->queries_this_minute);
             send_prompt(conn->socket, conn);
+            send(conn->socket, "<<EOF>>", 7, 0);
             continue;
         }
         
@@ -996,7 +1089,10 @@ static void *client_handler(void *arg) {
                  (strcasecmp(arg1, "DATABASES") == 0 || strcasecmp(arg1, "DATABASE") == 0)) {
             // SHOW DATABASES / DEKHO DATABASES — route through SQL engine
             if (conn->authenticated) {
-                execute_client_query(conn, buffer);
+                // Ensure query ends with semicolon for parser
+                char db_query[256];
+                snprintf(db_query, sizeof(db_query), "%s;", buffer);
+                execute_client_query(conn, db_query);
             } else {
                 send(conn->socket, "\n\033[31mAuthentication required.\033[0m\n", 38, 0);
             }
@@ -1011,7 +1107,23 @@ static void *client_handler(void *arg) {
             execute_client_query(conn, buffer);
         }
         
-        send_prompt(conn->socket, conn);
+        // Send EOF marker so legacy clients know the response is complete
+        if (!conn->use_binary_protocol) {
+            // Combine prompt + EOF into a single send to prevent TCP fragmentation
+            char prompt_buf[256];
+            if (!conn->authenticated) {
+                snprintf(prompt_buf, sizeof(prompt_buf), 
+                    "\n\033[33m[not authenticated]\033[0m inventix> <<EOF>>");
+            } else {
+                snprintf(prompt_buf, sizeof(prompt_buf),
+                    "\n\033[32m[%s@%s]\033[0m inventix> <<EOF>>",
+                    conn->session ? conn->session->username : "unknown",
+                    conn->ctx.current_db);
+            }
+            send(conn->socket, prompt_buf, (int)strlen(prompt_buf), 0);
+        } else {
+            send_prompt(conn->socket, conn);
+        }
     }
     
     if (conn->authenticated) {
@@ -1089,7 +1201,6 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to initialize security\n");
         return 1;
     }
-    security_load("security.dat");
     
     // Initialize prepared statement and index systems
     prepared_init();
@@ -1107,6 +1218,11 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--master") == 0) dist_set_master(1);
         else if (strcmp(argv[i], "--worker") == 0) dist_set_master(0);
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) g_port = atoi(argv[++i]);
+    }
+    
+    // Only create connection pools to workers if this node is master
+    if (dist_is_master()) {
+        dist_create_pools();
     }
     
     pthread_mutex_init(&g_client_lock, NULL);
@@ -1140,6 +1256,10 @@ int main(int argc, char *argv[]) {
     c = sizeof(struct sockaddr_in);
     
     while (g_running && (new_socket = accept(server_fd, (struct sockaddr *)&client, &c)) != INVALID_SOCKET) {
+        // Disable Nagle's algorithm for instant response delivery
+        int nodelay = 1;
+        setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+        
         ClientConnection *conn = calloc(1, sizeof(ClientConnection));
         if (!conn) { closesocket(new_socket); continue; }
         

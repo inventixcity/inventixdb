@@ -43,6 +43,8 @@ LexerTokenType check_keyword(const char *str) {
     if (strcasecmp(str, "FLOAT") == 0) return TOKEN_KW_FLOAT;
     if (strcasecmp(str, "DOUBLE") == 0) return TOKEN_KW_FLOAT;
     if (strcasecmp(str, "STRING") == 0) return TOKEN_KW_STRING_TYPE;
+    if (strcasecmp(str, "VARCHAR") == 0) return TOKEN_KW_STRING_TYPE;
+    if (strcasecmp(str, "CHAR") == 0) return TOKEN_KW_STRING_TYPE;
     if (strcasecmp(str, "TEXT") == 0) return TOKEN_KW_TEXT_TYPE;
     if (strcasecmp(str, "BOOL") == 0) return TOKEN_KW_BOOL_TYPE;
     if (strcasecmp(str, "BOOLEAN") == 0) return TOKEN_KW_BOOL_TYPE;

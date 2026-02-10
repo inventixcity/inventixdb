@@ -185,7 +185,6 @@ int main() {
     
     // Initialize Security System (PBKDF2, RBAC, Sessions)
     security_init();
-    security_load("security.dat");
     
     // Initialize Session
     SessionContext ctx;

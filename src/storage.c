@@ -521,6 +521,8 @@ KVStore* kv_create() {
     store->count = 0;
     store->entries = calloc(store->capacity, sizeof(KVEntry));
     store->indexes = NULL;
+    store->log_fp = NULL;
+    store->log_size = 0;
     pthread_mutex_init(&store->lock, NULL);
     
     // Initialize New Engine

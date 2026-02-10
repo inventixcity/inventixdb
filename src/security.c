@@ -399,15 +399,21 @@ int security_init(void) {
     pthread_mutex_init((pthread_mutex_t*)g_security->lock, NULL);
 #endif
     
-    // Initialize roles
+    // Initialize roles first (needed before loading/creating users)
     security_init_roles();
     
-    // Create default superuser
-    char error[128];
-    int user_id = security_create_user("admin", "Admin@123", ROLE_SUPERADMIN, error);
-    if (user_id >= 0) {
-        g_security->users[user_id].is_superuser = true;
-        LOG_INFO("Created default superuser 'admin'");
+    // Try to restore persisted users from security.dat
+    if (security_load("security.dat") == 0) {
+        LOG_INFO("Restored %d users from security.dat", g_security->user_count);
+    } else {
+        // No saved state — create default superuser
+        char error[128];
+        int user_id = security_create_user("admin", "Admin@123", ROLE_SUPERADMIN, error);
+        if (user_id >= 0) {
+            // user_id is 1-based, array is 0-indexed
+            g_security->users[user_id - 1].is_superuser = true;
+            LOG_INFO("Created default superuser 'admin'");
+        }
     }
     
     g_security->initialized = true;
@@ -491,10 +497,18 @@ int security_create_user(const char *username, const char *password,
     user->status = USER_STATUS_ACTIVE;
     user->created_at = time(NULL);
     
+    // Auto-set superuser flag for superadmin role
+    if (role && strcmp(role, ROLE_SUPERADMIN) == 0) {
+        user->is_superuser = true;
+    }
+    
     g_security->user_count++;
     
     LOG_INFO("Created user '%s' with role '%s'", username, user->roles[0]);
     security_audit_log("USER_CREATE", username, "system", "User created");
+    
+    // Persist immediately so users survive server restart
+    security_save("security.dat");
     
     return user->user_id;
 }
@@ -523,6 +537,7 @@ int security_delete_user(const char *username) {
             
             LOG_INFO("Deleted user '%s'", username);
             security_audit_log("USER_DELETE", username, "system", "User deleted");
+            security_save("security.dat");
             return 0;
         }
     }
@@ -556,6 +571,7 @@ int security_change_password(const char *username, const char *new_password) {
     
     LOG_INFO("Password changed for user '%s'", username);
     security_audit_log("PASSWORD_CHANGE", username, "system", "Password changed");
+    security_save("security.dat");
     
     return 0;
 }
@@ -902,7 +918,8 @@ bool security_authorize_command(Session *session, const char *cmd_type) {
         required = PERM_UPDATE;
     } else if (strcmp(cmd_type, "DELETE") == 0 || strcmp(cmd_type, "HATAO") == 0) {
         required = PERM_DELETE;
-    } else if (strcmp(cmd_type, "CREATE TABLE") == 0 || strcmp(cmd_type, "BANAO") == 0) {
+    } else if (strcmp(cmd_type, "CREATE TABLE") == 0 || strcmp(cmd_type, "BANAO") == 0 ||
+               strcmp(cmd_type, "TABLE") == 0 || strcmp(cmd_type, "CREATE") == 0) {
         required = PERM_CREATE_TABLE;
     } else if (strcmp(cmd_type, "DROP TABLE") == 0 || strcmp(cmd_type, "GIRAO") == 0) {
         required = PERM_DROP_TABLE;

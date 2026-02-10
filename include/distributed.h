@@ -13,6 +13,7 @@ typedef struct {
 
 // Initialization and shutdown
 void dist_init(void);
+void dist_create_pools(void);
 void dist_shutdown(void);
 
 // Master/Worker mode

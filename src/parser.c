@@ -221,7 +221,16 @@ ASTNode* parse_create_table(ParserContext *ctx) {
         }
 
         node->data.create_table.columns[node->data.create_table.col_count].name = strdup(colName->value);
-        node->data.create_table.columns[node->data.create_table.col_count].type = strdup(colType->value ? colType->value : "TYPE");
+        
+        // Map token type to actual type string (keyword tokens have NULL value)
+        const char *type_str = "UNKNOWN";
+        if (colType->type == TOKEN_KW_INT) type_str = "INT";
+        else if (colType->type == TOKEN_KW_FLOAT) type_str = "FLOAT";
+        else if (colType->type == TOKEN_KW_STRING_TYPE) type_str = "STRING";
+        else if (colType->type == TOKEN_KW_TEXT_TYPE) type_str = "TEXT";
+        else if (colType->type == TOKEN_KW_BOOL_TYPE) type_str = "BOOL";
+        
+        node->data.create_table.columns[node->data.create_table.col_count].type = strdup(type_str);
         node->data.create_table.columns[node->data.create_table.col_count].is_pk = is_pk;
         node->data.create_table.col_count++;
 

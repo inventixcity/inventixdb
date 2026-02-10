@@ -240,15 +240,15 @@ static int connect_to_server(const char *host, int port) {
     int opt = 1;
     setsockopt(g_client.socket, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
     
-    // Set timeout
+    // Set timeout (3 seconds — enough for queries, fast fallback)
 #ifdef _WIN32
-    DWORD timeout = 10000;
+    DWORD timeout = 3000;
     setsockopt(g_client.socket, SOL_SOCKET, SO_RCVTIMEO, 
                (const char*)&timeout, sizeof(timeout));
     setsockopt(g_client.socket, SOL_SOCKET, SO_SNDTIMEO, 
                (const char*)&timeout, sizeof(timeout));
 #else
-    struct timeval tv = {10, 0};
+    struct timeval tv = {3, 0};
     setsockopt(g_client.socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(g_client.socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
@@ -279,6 +279,24 @@ static int connect_to_server(const char *host, int port) {
     printf("Connected to InventixDB at %s:%d (protocol: %s)\n", 
            host, port,
            g_client.protocol_mode == PROTOCOL_BINARY ? "binary" : "text");
+    
+    // Read and display the server's initial banner
+    {
+        char banner[BUFFER_SIZE] = {0};
+        size_t total = 0;
+        bool found_eof = false;
+        while (!found_eof && total < sizeof(banner) - 1) {
+            int len = recv(g_client.socket, banner + total, (int)(sizeof(banner) - total - 1), 0);
+            if (len <= 0) break;
+            total += len;
+            banner[total] = '\0';
+            if (strstr(banner, EOF_MARKER)) found_eof = true;
+        }
+        char *marker = strstr(banner, EOF_MARKER);
+        if (marker) *marker = '\0';
+        // Banner is consumed silently (server shows it on its side)
+    }
+    
     return 0;
 }
 

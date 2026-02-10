@@ -21,21 +21,15 @@ void dist_init() {
     // Initialize network subsystem
     net_init();
     
-    // Load workers from configuration
+    // Load worker addresses from configuration (pools created lazily on first use)
     if (g_config.config_loaded) {
         g_worker_count = CFG_DISTRIBUTED.worker_count;
         for (int i = 0; i < g_worker_count && i < MAX_WORKERS; i++) {
             g_workers[i].ip = strdup(CFG_DISTRIBUTED.workers[i].ip);
             g_workers[i].port = CFG_DISTRIBUTED.workers[i].port;
-            
-            // Create connection pool for each worker
-            g_worker_pools[i] = conn_pool_create(g_workers[i].ip, g_workers[i].port, 2, 16);
-            if (g_worker_pools[i]) {
-                LOG_DIST(LOG_LEVEL_DEBUG, "Created connection pool for worker %d (%s:%d)",
-                         i, g_workers[i].ip, g_workers[i].port);
-            }
+            g_worker_pools[i] = NULL; // pools created lazily
         }
-        LOG_DIST(LOG_LEVEL_INFO, "Loaded %d workers from config (with connection pooling)", g_worker_count);
+        LOG_DIST(LOG_LEVEL_INFO, "Loaded %d workers from config", g_worker_count);
     } else {
         // Fallback defaults
         g_workers[0].ip = "127.0.0.1";
@@ -45,6 +39,20 @@ void dist_init() {
         g_worker_count = 2;
         LOG_DIST(LOG_LEVEL_WARN, "Using default workers (config not loaded)");
     }
+}
+
+// Create connection pools for workers (called only when master mode is set)
+void dist_create_pools(void) {
+    for (int i = 0; i < g_worker_count && i < MAX_WORKERS; i++) {
+        if (!g_worker_pools[i] && g_workers[i].ip) {
+            g_worker_pools[i] = conn_pool_create(g_workers[i].ip, g_workers[i].port, 2, 16);
+            if (g_worker_pools[i]) {
+                LOG_DIST(LOG_LEVEL_DEBUG, "Created connection pool for worker %d (%s:%d)",
+                         i, g_workers[i].ip, g_workers[i].port);
+            }
+        }
+    }
+    LOG_DIST(LOG_LEVEL_INFO, "Connection pools created for %d workers", g_worker_count);
 }
 
 void dist_shutdown(void) {
